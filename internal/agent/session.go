@@ -1,0 +1,60 @@
+package agent
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"code-review-agent/internal/llm"
+	"code-review-agent/internal/tools"
+)
+
+type Session struct {
+	SavedAt   string         `json:"saved_at"`
+	Workspace string         `json:"workspace"`
+	Skills    []string       `json:"skills,omitempty"`
+	Messages  []llm.Message  `json:"messages"`
+	Snapshot  tools.Snapshot `json:"snapshot"`
+}
+
+func (a *Agent) SaveSession(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	session := Session{
+		SavedAt:   time.Now().Format(time.RFC3339),
+		Workspace: a.tools.Workspace(),
+		Skills:    a.prompts.LoadedSkillNames(),
+		Messages:  a.messages,
+		Snapshot:  a.tools.Snapshot(),
+	}
+	data, err := json.MarshalIndent(session, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+func (a *Agent) LoadSession(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var session Session
+	if err := json.Unmarshal(data, &session); err != nil {
+		return err
+	}
+	if session.Workspace != "" {
+		if err := a.tools.SetWorkspace(session.Workspace); err != nil {
+			return fmt.Errorf("restore workspace %q: %w", session.Workspace, err)
+		}
+	}
+	a.prompts.SetLoadedSkills(session.Skills)
+	a.messages = append([]llm.Message(nil), session.Messages...)
+	a.sanitizeMessages()
+	a.tools.RestoreSnapshot(session.Snapshot)
+	a.pendingEndAudit = false
+	return nil
+}
