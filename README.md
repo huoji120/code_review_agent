@@ -22,7 +22,7 @@ prompts:
 
 agent:
   max_turns: 0
-  summary_interval: 30
+  summary_interval: 66
   retry_attempts: 3
   compress_at_ratio: 0.70
   compress_buffer_tokens: 393216
@@ -54,7 +54,7 @@ prompts:
 
 agent:
   max_turns: 0
-  summary_interval: 20
+  summary_interval: 30
   auto_save_interval: 5
   session_dir: sessions
   retry_attempts: 3
@@ -69,4 +69,5 @@ agent:
 ![img](img/1.png)
 ![img](img/2.png)
 
-按下键盘的 <-- 键可以选中左边 上下滚动 按下ESC暂停审计可以跟模型对话 go继续审计 其他功能自己看 
+按下键盘的 <-- 键可以选中左边 上下滚动 按下ESC暂停审计可以跟模型对话 go继续审计 其他功能自己看  
+根据测试表明,summary_interval和模型懒惰之间有一定的联系,summary_interval为30的deepseek比summary_interval为66的更勤快,表现为不会随随便便的终止agent loop从而继续勤奋的看代码,但是过小的summary_interval可能会导致模型陷入某种死循环,需要酌情考虑.

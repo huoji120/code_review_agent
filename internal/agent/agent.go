@@ -538,6 +538,13 @@ func (a *Agent) chatStream(ctx context.Context, emit func(Event)) (string, error
 		if errors.Is(err, context.Canceled) {
 			return answer, err
 		}
+		if isContextLengthError(err) {
+			if compressErr := a.compressRecentContext(ctx, emit, "model context limit exceeded"); compressErr != nil {
+				return "", compressErr
+			}
+			lastErr = err
+			continue
+		}
 		lastErr = err
 		if attempt < attempts {
 			emit(Event{Kind: "error", Content: fmt.Sprintf("模型请求失败：%s。正在自动重试 %d/%d。", err.Error(), attempt+1, attempts)})
@@ -551,7 +558,7 @@ func (a *Agent) chatStreamOnce(ctx context.Context, emit func(Event)) (string, e
 		return "", ctx.Err()
 	}
 	if !a.cfg.OpenAI.Stream {
-		answer, err := a.chatWithRetry(ctx, a.messages, emit)
+		answer, err := a.chatCurrentWithRetry(ctx, emit)
 		if err != nil {
 			return "", err
 		}
@@ -602,6 +609,35 @@ func (a *Agent) chatStreamOnce(ctx context.Context, emit func(Event)) (string, e
 	return joinAssistantMessage(fullThinking.String(), fullContent.String()), err
 }
 
+func (a *Agent) chatCurrentWithRetry(ctx context.Context, emit func(Event)) (string, error) {
+	attempts := a.retryAttempts()
+	var lastErr error
+	for attempt := 0; attempt <= attempts; attempt++ {
+		if attempt > 0 && emit != nil {
+			emit(Event{Kind: "info", Content: fmt.Sprintf("开始第 %d/%d 次模型重试请求。", attempt+1, attempts+1)})
+		}
+		answer, err := a.client.Chat(ctx, a.messages)
+		if err == nil {
+			return answer, nil
+		}
+		if errors.Is(err, context.Canceled) {
+			return "", err
+		}
+		if isContextLengthError(err) {
+			if compressErr := a.compressRecentContext(ctx, emit, "model context limit exceeded"); compressErr != nil {
+				return "", compressErr
+			}
+			lastErr = err
+			continue
+		}
+		lastErr = err
+		if attempt < attempts && emit != nil {
+			emit(Event{Kind: "error", Content: fmt.Sprintf("模型请求失败：%s。正在自动重试 %d/%d。", err.Error(), attempt+1, attempts)})
+		}
+	}
+	return "", lastErr
+}
+
 func joinAssistantMessage(thinking, content string) string {
 	if thinking == "" {
 		return content
@@ -634,6 +670,16 @@ func (a *Agent) chatWithRetry(ctx context.Context, messages []llm.Message, emit 
 		}
 	}
 	return "", lastErr
+}
+
+func isContextLengthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "maximum context length") ||
+		strings.Contains(text, "context length") ||
+		strings.Contains(text, "input_tokens")
 }
 
 func (a *Agent) retryAttempts() int {
@@ -670,6 +716,51 @@ func (a *Agent) compressionLimit() int {
 func (a *Agent) compressContext(ctx context.Context, emit func(Event), reason string) error {
 	a.sanitizeMessages()
 	emit(Event{Kind: "tool", Content: "compressing context: " + reason})
+	return a.compressMessages(ctx, emit, reason, a.messages[1:])
+}
+
+func (a *Agent) compressRecentContext(ctx context.Context, emit func(Event), reason string) error {
+	a.sanitizeMessages()
+	limit := a.recentCompressionLimit()
+	recent := selectRecentMessages(a.messages[1:], limit)
+	emit(Event{Kind: "tool", Content: fmt.Sprintf("compressing recent context: %s (keeping about %d tokens)", reason, estimateTokens(recent))})
+	return a.compressMessages(ctx, emit, reason+"; using recent context only", recent)
+}
+
+func (a *Agent) recentCompressionLimit() int {
+	limit := a.compressionLimit() / 2
+	reserved := estimateTextTokens(a.prompts.Compress) + estimateTextTokens(a.systemPrompt()) + estimateTextTokens(a.statePrompt(200)) + 2048
+	budget := a.cfg.OpenAI.MaxContextTokens - a.cfg.OpenAI.MaxOutputTokens - reserved
+	if budget > 0 && budget < limit {
+		limit = budget
+	}
+	if limit < 4096 {
+		limit = 4096
+	}
+	return limit
+}
+
+func selectRecentMessages(messages []llm.Message, limit int) []llm.Message {
+	if limit <= 0 || estimateTokens(messages) <= limit {
+		return messages
+	}
+	var selected []llm.Message
+	tokens := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		msgTokens := estimateTextTokens(messages[i].Content)
+		if len(selected) > 0 && tokens+msgTokens > limit {
+			break
+		}
+		selected = append(selected, messages[i])
+		tokens += msgTokens
+	}
+	for i, j := 0, len(selected)-1; i < j; i, j = i+1, j-1 {
+		selected[i], selected[j] = selected[j], selected[i]
+	}
+	return selected
+}
+
+func (a *Agent) compressMessages(ctx context.Context, emit func(Event), reason string, messages []llm.Message) error {
 	var b strings.Builder
 	b.WriteString("Compression reason: ")
 	b.WriteString(reason)
@@ -678,7 +769,7 @@ func (a *Agent) compressContext(ctx context.Context, emit func(Event), reason st
 	b.WriteString("\n")
 	b.WriteString(a.statePrompt(200))
 	b.WriteString("\nConversation to compress:\n")
-	for _, msg := range a.messages[1:] {
+	for _, msg := range messages {
 		b.WriteString(string(msg.Role))
 		b.WriteString(":\n")
 		b.WriteString(msg.Content)
@@ -750,11 +841,44 @@ func (a *Agent) statePrompt(limit int) string {
 }
 
 func estimateTokens(messages []llm.Message) int {
-	chars := 0
+	tokens := 0
 	for _, msg := range messages {
-		chars += len(msg.Content)
+		tokens += estimateTextTokens(msg.Content) + 4
 	}
-	return chars / 4
+	return tokens
+
+}
+
+func estimateTextTokens(text string) int {
+	if text == "" {
+		return 0
+	}
+	asciiRun := 0
+	tokens := 0
+	flushASCII := func() {
+		if asciiRun == 0 {
+			return
+		}
+		tokens += (asciiRun + 3) / 4
+		asciiRun = 0
+	}
+	for _, r := range text {
+		if r <= 0x7f {
+			asciiRun++
+			continue
+		}
+		flushASCII()
+		if r >= 0x4e00 && r <= 0x9fff {
+			tokens++
+		} else {
+			tokens += 2
+		}
+	}
+	flushASCII()
+	if tokens == 0 {
+		return 1
+	}
+	return tokens
 }
 
 func parseToolCall(text string) (ToolCall, bool) {

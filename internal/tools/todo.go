@@ -52,7 +52,7 @@ func normalizeTodoID(value interface{}) (int, error) {
 		}
 		return id, nil
 	case nil:
-		return 0, fmt.Errorf("id is required")
+		return 0, nil
 	default:
 		return 0, fmt.Errorf("invalid todo id type %T", value)
 	}
@@ -80,10 +80,15 @@ func (r *Registry) todoUpdate(raw json.RawMessage) Result {
 	if err != nil {
 		return Result{OK: false, Error: err.Error()}
 	}
-	for i := range r.todos {
-		if r.todos[i].ID != args.ID {
-			continue
-		}
+	if args.Status == "done" {
+		args.Status = "completed"
+	}
+	index, err := r.findTodoIndex(args)
+	if err != nil {
+		return Result{OK: false, Error: err.Error()}
+	}
+	if index >= 0 {
+		i := index
 		if args.Title != "" {
 			r.todos[i].Title = args.Title
 		}
@@ -96,6 +101,34 @@ func (r *Registry) todoUpdate(raw json.RawMessage) Result {
 		return Result{OK: true, Data: r.todos, Message: "todo updated"}
 	}
 	return Result{OK: false, Error: "todo not found"}
+}
+
+func (r *Registry) findTodoIndex(args todoUpdateArgs) (int, error) {
+	if args.ID > 0 {
+		for i := range r.todos {
+			if r.todos[i].ID == args.ID {
+				return i, nil
+			}
+		}
+		return -1, nil
+	}
+
+	title := strings.TrimSpace(args.Title)
+	if title == "" {
+		return -1, fmt.Errorf("id is required when title is not provided")
+	}
+
+	match := -1
+	for i := range r.todos {
+		if r.todos[i].Title != title {
+			continue
+		}
+		if match >= 0 {
+			return -1, fmt.Errorf("multiple todos match title %q; provide id", title)
+		}
+		match = i
+	}
+	return match, nil
 }
 
 func (r *Registry) Todos() []Todo {
