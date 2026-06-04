@@ -36,13 +36,14 @@ func main() {
 	}
 
 	client := llm.NewOpenAIClient(cfg.OpenAI)
+	compressClient := llm.NewOpenAIClient(cfg.CompressOpenAI)
 	registry, err := tools.NewRegistry(cfg.Workspace, cfg.Agent.MaxToolResultChars)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init tools: %v\n", err)
 		os.Exit(1)
 	}
 
-	runner := agent.New(cfg, prompts, client, registry)
+	runner := agent.NewWithCompressClient(cfg, prompts, client, compressClient, registry)
 	program := tea.NewProgram(tui.New(runner, cfg, *auditDir), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "run tui: %v\n", err)

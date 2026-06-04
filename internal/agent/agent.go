@@ -19,6 +19,7 @@ type Agent struct {
 	cfg             config.Config
 	prompts         prompt.Prompts
 	client          llm.Client
+	compressClient  llm.Client
 	tools           *tools.Registry
 	messages        []llm.Message
 	pendingEndAudit bool
@@ -46,7 +47,14 @@ type ToolCall struct {
 }
 
 func New(cfg config.Config, prompts prompt.Prompts, client llm.Client, registry *tools.Registry) *Agent {
-	a := &Agent{cfg: cfg, prompts: prompts, client: client, tools: registry}
+	return NewWithCompressClient(cfg, prompts, client, client, registry)
+}
+
+func NewWithCompressClient(cfg config.Config, prompts prompt.Prompts, client llm.Client, compressClient llm.Client, registry *tools.Registry) *Agent {
+	if compressClient == nil {
+		compressClient = client
+	}
+	a := &Agent{cfg: cfg, prompts: prompts, client: client, compressClient: compressClient, tools: registry}
 	a.messages = []llm.Message{{Role: llm.RoleSystem, Content: a.systemPrompt()}}
 	return a
 }
@@ -539,7 +547,7 @@ func (a *Agent) chatStream(ctx context.Context, emit func(Event)) (string, error
 			return answer, err
 		}
 		if isContextLengthError(err) {
-			if compressErr := a.compressRecentContext(ctx, emit, "model context limit exceeded"); compressErr != nil {
+			if compressErr := a.compressContext(ctx, emit, "model context limit exceeded"); compressErr != nil {
 				return "", compressErr
 			}
 			lastErr = err
@@ -624,7 +632,7 @@ func (a *Agent) chatCurrentWithRetry(ctx context.Context, emit func(Event)) (str
 			return "", err
 		}
 		if isContextLengthError(err) {
-			if compressErr := a.compressRecentContext(ctx, emit, "model context limit exceeded"); compressErr != nil {
+			if compressErr := a.compressContext(ctx, emit, "model context limit exceeded"); compressErr != nil {
 				return "", compressErr
 			}
 			lastErr = err
@@ -651,13 +659,17 @@ func joinAssistantMessage(thinking, content string) string {
 }
 
 func (a *Agent) chatWithRetry(ctx context.Context, messages []llm.Message, emit func(Event)) (string, error) {
+	return a.chatWithRetryClient(ctx, a.client, messages, emit)
+}
+
+func (a *Agent) chatWithRetryClient(ctx context.Context, client llm.Client, messages []llm.Message, emit func(Event)) (string, error) {
 	attempts := a.retryAttempts()
 	var lastErr error
 	for attempt := 0; attempt <= attempts; attempt++ {
 		if attempt > 0 && emit != nil {
 			emit(Event{Kind: "info", Content: fmt.Sprintf("开始第 %d/%d 次模型重试请求。", attempt+1, attempts+1)})
 		}
-		answer, err := a.client.Chat(ctx, messages)
+		answer, err := client.Chat(ctx, messages)
 		if err == nil {
 			return answer, nil
 		}
@@ -665,6 +677,9 @@ func (a *Agent) chatWithRetry(ctx context.Context, messages []llm.Message, emit 
 			return "", err
 		}
 		lastErr = err
+		if isContextLengthError(err) {
+			return "", err
+		}
 		if attempt < attempts && emit != nil {
 			emit(Event{Kind: "error", Content: fmt.Sprintf("模型请求失败：%s。正在自动重试 %d/%d。", err.Error(), attempt+1, attempts)})
 		}
@@ -719,47 +734,6 @@ func (a *Agent) compressContext(ctx context.Context, emit func(Event), reason st
 	return a.compressMessages(ctx, emit, reason, a.messages[1:])
 }
 
-func (a *Agent) compressRecentContext(ctx context.Context, emit func(Event), reason string) error {
-	a.sanitizeMessages()
-	limit := a.recentCompressionLimit()
-	recent := selectRecentMessages(a.messages[1:], limit)
-	emit(Event{Kind: "tool", Content: fmt.Sprintf("compressing recent context: %s (keeping about %d tokens)", reason, estimateTokens(recent))})
-	return a.compressMessages(ctx, emit, reason+"; using recent context only", recent)
-}
-
-func (a *Agent) recentCompressionLimit() int {
-	limit := a.compressionLimit() / 2
-	reserved := estimateTextTokens(a.prompts.Compress) + estimateTextTokens(a.systemPrompt()) + estimateTextTokens(a.statePrompt(200)) + 2048
-	budget := a.cfg.OpenAI.MaxContextTokens - a.cfg.OpenAI.MaxOutputTokens - reserved
-	if budget > 0 && budget < limit {
-		limit = budget
-	}
-	if limit < 4096 {
-		limit = 4096
-	}
-	return limit
-}
-
-func selectRecentMessages(messages []llm.Message, limit int) []llm.Message {
-	if limit <= 0 || estimateTokens(messages) <= limit {
-		return messages
-	}
-	var selected []llm.Message
-	tokens := 0
-	for i := len(messages) - 1; i >= 0; i-- {
-		msgTokens := estimateTextTokens(messages[i].Content)
-		if len(selected) > 0 && tokens+msgTokens > limit {
-			break
-		}
-		selected = append(selected, messages[i])
-		tokens += msgTokens
-	}
-	for i, j := 0, len(selected)-1; i < j; i, j = i+1, j-1 {
-		selected[i], selected[j] = selected[j], selected[i]
-	}
-	return selected
-}
-
 func (a *Agent) compressMessages(ctx context.Context, emit func(Event), reason string, messages []llm.Message) error {
 	var b strings.Builder
 	b.WriteString("Compression reason: ")
@@ -775,7 +749,7 @@ func (a *Agent) compressMessages(ctx context.Context, emit func(Event), reason s
 		b.WriteString(msg.Content)
 		b.WriteString("\n\n")
 	}
-	compressed, err := a.chatWithRetry(ctx, []llm.Message{
+	compressed, err := a.chatWithRetryClient(ctx, a.compressClient, []llm.Message{
 		{Role: llm.RoleSystem, Content: a.prompts.Compress + "\n\n下面是恢复审计后必须继续遵守的完整系统提示和工具协议：\n\n" + a.systemPrompt()},
 		{Role: llm.RoleUser, Content: a.render("compress_user", map[string]string{"state_and_conversation": b.String(), "summary_interval": fmt.Sprint(a.cfg.Agent.SummaryInterval)})},
 	}, emit)

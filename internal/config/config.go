@@ -9,10 +9,11 @@ import (
 )
 
 type Config struct {
-	Workspace string       `yaml:"workspace"`
-	OpenAI    OpenAIConfig `yaml:"openai"`
-	Prompts   PromptConfig `yaml:"prompts"`
-	Agent     AgentConfig  `yaml:"agent"`
+	Workspace      string       `yaml:"workspace"`
+	OpenAI         OpenAIConfig `yaml:"openai"`
+	CompressOpenAI OpenAIConfig `yaml:"compress_openai"`
+	Prompts        PromptConfig `yaml:"prompts"`
+	Agent          AgentConfig  `yaml:"agent"`
 }
 
 type OpenAIConfig struct {
@@ -58,14 +59,20 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	applyDefaults(&cfg)
-	if cfg.OpenAI.APIKey == "" && cfg.OpenAI.APIKeyEnv != "" {
-		if looksLikeAPIKey(cfg.OpenAI.APIKeyEnv) {
-			cfg.OpenAI.APIKey = cfg.OpenAI.APIKeyEnv
-		} else {
-			cfg.OpenAI.APIKey = os.Getenv(cfg.OpenAI.APIKeyEnv)
-		}
-	}
+	resolveAPIKey(&cfg.OpenAI)
+	resolveAPIKey(&cfg.CompressOpenAI)
 	return cfg, nil
+}
+
+func resolveAPIKey(cfg *OpenAIConfig) {
+	if cfg.APIKey != "" || cfg.APIKeyEnv == "" {
+		return
+	}
+	if looksLikeAPIKey(cfg.APIKeyEnv) {
+		cfg.APIKey = cfg.APIKeyEnv
+	} else {
+		cfg.APIKey = os.Getenv(cfg.APIKeyEnv)
+	}
 }
 
 func looksLikeAPIKey(value string) bool {
@@ -107,6 +114,7 @@ func applyDefaults(cfg *Config) {
 	if cfg.OpenAI.TimeoutSeconds == 0 {
 		cfg.OpenAI.TimeoutSeconds = int((120 * time.Second).Seconds())
 	}
+	applyCompressOpenAIDefaults(cfg)
 	if cfg.Prompts.System == "" {
 		cfg.Prompts.System = "prompts/system.md"
 	}
@@ -143,4 +151,40 @@ func applyDefaults(cfg *Config) {
 	if cfg.Agent.MaxToolResultChars == 0 {
 		cfg.Agent.MaxToolResultChars = 12000
 	}
+}
+
+func applyCompressOpenAIDefaults(cfg *Config) {
+	compress := cfg.CompressOpenAI
+	if compress.BaseURL == "" && compress.APIKey == "" && compress.APIKeyEnv == "" && compress.Model == "" {
+		cfg.CompressOpenAI = cfg.OpenAI
+		cfg.CompressOpenAI.Stream = false
+		return
+	}
+	if compress.BaseURL == "" {
+		compress.BaseURL = cfg.OpenAI.BaseURL
+	}
+	if compress.APIInterface == "" {
+		compress.APIInterface = cfg.OpenAI.APIInterface
+	}
+	if compress.APIKey == "" && compress.APIKeyEnv == "" {
+		compress.APIKey = cfg.OpenAI.APIKey
+		compress.APIKeyEnv = cfg.OpenAI.APIKeyEnv
+	}
+	if compress.Model == "" {
+		compress.Model = cfg.OpenAI.Model
+	}
+	if compress.TopP == 0 {
+		compress.TopP = cfg.OpenAI.TopP
+	}
+	if compress.MaxContextTokens == 0 {
+		compress.MaxContextTokens = cfg.OpenAI.MaxContextTokens
+	}
+	if compress.MaxOutputTokens == 0 {
+		compress.MaxOutputTokens = cfg.OpenAI.MaxOutputTokens
+	}
+	if compress.TimeoutSeconds == 0 {
+		compress.TimeoutSeconds = cfg.OpenAI.TimeoutSeconds
+	}
+	compress.Stream = false
+	cfg.CompressOpenAI = compress
 }
