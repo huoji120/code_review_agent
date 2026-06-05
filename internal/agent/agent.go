@@ -187,6 +187,9 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 		}
 		result := a.callTool(ctx, emit, call)
 		a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + result})
+		if !tools.IsKnownTool(call.Name) {
+			a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: a.unknownToolCorrection(call.Name)})
+		}
 		emit(Event{Kind: "tool", Content: a.displayToolResult(call.Name, result)})
 		a.emitState(emit)
 		if tools.IsTerminalTool(call.Name) {
@@ -194,6 +197,16 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 			return
 		}
 	}
+}
+
+func (a *Agent) unknownToolCorrection(name string) string {
+	var b strings.Builder
+	b.WriteString("你刚才调用了不存在的工具：")
+	b.WriteString(name)
+	b.WriteString("。下一条回复必须只输出一个裸的 <tool_call> JSON，且 name 必须从下面可用工具列表中选择；不要继续调用不存在的工具，不要解释，不要输出 markdown。\n\n")
+	b.WriteString("请重新阅读 system prompt 中的工具列表，当前可用工具如下：\n\n")
+	b.WriteString(a.tools.ToolPrompt())
+	return b.String()
 }
 
 func (a *Agent) callTool(ctx context.Context, emit func(Event), call ToolCall) string {
@@ -743,7 +756,7 @@ func (a *Agent) compressMessages(ctx context.Context, emit func(Event), reason s
 	b.WriteString("\n")
 	b.WriteString(a.statePrompt(200))
 	b.WriteString("\nConversation to compress:\n")
-	for _, msg := range messages {
+	for _, msg := range sanitizeMessagesForCompression(messages) {
 		b.WriteString(string(msg.Role))
 		b.WriteString(":\n")
 		b.WriteString(msg.Content)
@@ -765,6 +778,44 @@ func (a *Agent) compressMessages(ctx context.Context, emit func(Event), reason s
 	emit(Event{Kind: "ui_compact", Content: "## 上下文已压缩\n\n" + compressed})
 	a.emitState(emit)
 	return nil
+}
+
+func sanitizeMessagesForCompression(messages []llm.Message) []llm.Message {
+	cleaned := make([]llm.Message, 0, len(messages))
+	for _, msg := range messages {
+		content := msg.Content
+		if msg.Role == llm.RoleAssistant {
+			content = removeThinkBlocks(content)
+		}
+		if msg.Role == llm.RoleUser && strings.HasPrefix(content, "Tool result for ") {
+			content = omitToolResultForCompression(content)
+		}
+		cleaned = append(cleaned, llm.Message{Role: msg.Role, Content: strings.TrimSpace(content)})
+	}
+	return cleaned
+}
+
+func removeThinkBlocks(content string) string {
+	for {
+		start := strings.Index(content, "<think>")
+		if start < 0 {
+			return content
+		}
+		end := strings.Index(content[start+len("<think>"):], "</think>")
+		if end < 0 {
+			return content
+		}
+		end += start + len("<think>") + len("</think>")
+		content = content[:start] + content[end:]
+	}
+}
+
+func omitToolResultForCompression(content string) string {
+	lineEnd := strings.IndexByte(content, '\n')
+	if lineEnd < 0 {
+		return content + "\n[tool result omitted during compression]"
+	}
+	return strings.TrimSpace(content[:lineEnd]) + "\n[tool result omitted during compression]"
 }
 
 func (a *Agent) statePrompt(limit int) string {

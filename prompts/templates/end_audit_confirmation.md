@@ -1,5 +1,7 @@
-你调用了 end_audit，但仍有 unseen/reviewing 文件。请先确认这些文件是否确实无需继续审计。
+你调用了 end_audit，但仍有 unseen/reviewing 文件。不要因为已经发现漏洞、剩余文件很多、避免盲扫、某个方向无法闭环或主观觉得没有价值就结束。
 
 !{files}
 
-如果这些文件已经确认不需要继续审计，请先简短说明理由，然后再次调用 end_audit；第二次调用将允许结束。如果还需要审计，请继续调用 read_file/search_content/file_review_update。
+请先判断剩余文件中是否还有入口文件、配置文件、模板、控制器、服务层、DAO、路由、权限相关文件、文件操作、SQL/命令执行、反序列化、上传下载或插件扩展代码。只要存在这些类型，就必须继续调用 todo_create/read_file/search_content/flow_review_update/file_review_update 审计。
+
+只有当你能确认剩余项都是静态资源、生成物、第三方样例、重复同类低价值文件，并且已经通过代表性读取和搜索覆盖对应风险面时，才允许再次调用 end_audit。再次调用时，summary 必须说明剩余文件数量与类别、已覆盖的高价值入口和搜索模式、为什么继续审计不会增加有效安全覆盖。

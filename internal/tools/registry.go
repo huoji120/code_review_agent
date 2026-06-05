@@ -181,6 +181,15 @@ func (r *Registry) Call(name string, raw json.RawMessage) string {
 	return out
 }
 
+func IsKnownTool(name string) bool {
+	switch name {
+	case "list_files", "read_file", "search_content", "search_context", "git_inspect", "todo_create", "todo_update", "file_review_update", "variable_review_update", "flow_review_update", "flow_review_delete", "review_state", "report_finding", "end_audit", "load_skill", "verify_finding":
+		return true
+	default:
+		return false
+	}
+}
+
 func IsTerminalTool(name string) bool {
 	return name == "end_audit"
 }
@@ -223,9 +232,9 @@ Windows 路径写入 JSON 时，如果使用反斜杠，必须写成双反斜杠
 - review_state：查看当前 todo、文件排查、变量排查、跨文件 flow 和漏洞状态。参数：limit。
 - verify_finding：启动一个不会压缩上下文的漏洞验证子 agent，复核候选漏洞是否真实成立。子 agent 可以继续调用工具、复读多文件利用链，并最终返回中文验证结论。参数：severity、title、path、line、evidence、impact、recommendation、cwe。
 - report_finding：只提交高置信度、证据清晰、利用链清楚、能造成实际危害的严重安全漏洞。调用前必须先用 variable_review_update 记录关键变量排查，并用 flow_review_update 记录跨文件入口、调用链、sink 和证据。参数：severity、title、path、line、evidence、impact、recommendation、cwe。severity 必须按系统提示词的严重性分级规则选择，不要随便报 high/critical；除 path 和 cwe 外尽量使用中文。
-- end_audit：结束审计。参数：summary、next_steps。必须使用中文。调用前应先调用 review_state 检查文件排查状态。理想情况下文件都已 reviewed/skipped 再结束；不要因为只发现一个漏洞或主观觉得“没有审计价值”就提前结束，必须继续深挖同一入口、同一模块、相邻文件和同类路径，尽可能一次找全问题。只有关键入口和高价值链路已经尽可能覆盖后，才允许在收到第一次提醒后第二次再次调用 end_audit 直接结束。summary 必须总结 todo、文件覆盖情况、变量/flow 和漏洞结论。
+- end_audit：结束审计。参数：summary、next_steps。必须使用中文。调用前应先调用 review_state 检查文件排查状态。理想情况下文件都已 reviewed/skipped 再结束；不要因为只发现一个漏洞、剩余文件很多、避免盲扫、某个方向无法闭环或主观觉得“没有审计价值”就提前结束，必须继续深挖同一入口、同一模块、相邻文件和同类路径，尽可能一次找全问题。只有关键入口、高风险文件类型、高价值链路、同类代表文件和相关搜索模式都已经尽可能覆盖后，才允许在收到第一次提醒后第二次再次调用 end_audit。summary 必须总结 todo、文件覆盖情况、剩余 unseen/reviewing 文件类别、变量/flow、漏洞结论和继续审计剩余项为何不会增加有效安全覆盖。
 
-怀疑发现漏洞时，先调用 variable_review_update 和 flow_review_update 补全变量传播和跨文件链路，然后优先调用 verify_finding 让漏洞验证子 agent 再次复核完整证据和利用链，不要直接调用 report_finding。flow 是临时排查队列：排查闭环、确认无害、已转成漏洞或不再需要时，必须调用 flow_review_delete 删除，不要攒着。只有确认严重安全漏洞且变量/flow 排查闭合，并且已经参考 verify_finding 返回的验证结论后，才能调用 report_finding。不要提交垃圾代码、普通 bug、低影响、无关紧要、无法证明危害或缺少清晰证据的问题。宁可少报，也不要乱报。发现一个漏洞后必须继续深挖相关入口、同类模式和相邻模块，尽可能找出更多问题；不要因为已有漏洞或主观觉得没有审计价值就结束。end_audit 在仍有未关闭文件时会先提醒一次；如果确认剩余文件无需继续逐个排查，第二次再次调用即可结束。`
+怀疑发现漏洞时，先调用 variable_review_update 和 flow_review_update 补全变量传播和跨文件链路，然后优先调用 verify_finding 让漏洞验证子 agent 再次复核完整证据和利用链，不要直接调用 report_finding。flow 是临时排查队列：排查闭环、确认无害、已转成漏洞或不再需要时，必须调用 flow_review_delete 删除，不要攒着。只有确认严重安全漏洞且变量/flow 排查闭合，并且已经参考 verify_finding 返回的验证结论后，才能调用 report_finding。不要提交垃圾代码、普通 bug、低影响、无关紧要、无法证明危害或缺少清晰证据的问题。宁可少报，也不要乱报。发现一个漏洞后必须继续深挖相关入口、同类模式和相邻模块，尽可能找出更多问题；不要因为已有漏洞、剩余文件很多、避免盲扫或主观觉得没有审计价值就结束。end_audit 在仍有未关闭文件时会先提醒一次；收到提醒后默认继续审计高价值剩余入口，只有确认剩余项都是静态资源、生成物、第三方样例、重复同类低价值文件，并且已通过代表性读取和搜索覆盖风险面时，第二次再次调用才可结束。`
 }
 
 func (r *Registry) Files() []FileReview {
