@@ -42,6 +42,8 @@ type AgentConfig struct {
 	SummaryInterval      int     `yaml:"summary_interval"`
 	AutoSaveInterval     int     `yaml:"auto_save_interval"`
 	SessionDir           string  `yaml:"session_dir"`
+	LogSession           bool    `yaml:"log_session"`
+	LogSessionDir        string  `yaml:"log_session_dir"`
 	RetryAttempts        int     `yaml:"retry_attempts"`
 	CompressAtRatio      float64 `yaml:"compress_at_ratio"`
 	CompressBufferTokens int     `yaml:"compress_buffer_tokens"`
@@ -138,6 +140,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Agent.SessionDir == "" {
 		cfg.Agent.SessionDir = "sessions"
+	}
+	if cfg.Agent.LogSessionDir == "" {
+		cfg.Agent.LogSessionDir = "log_sessions"
 	}
 	if cfg.Agent.RetryAttempts == 0 {
 		cfg.Agent.RetryAttempts = 3

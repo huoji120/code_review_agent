@@ -139,6 +139,11 @@ func cleanWorkspace(workspace string) (string, error) {
 }
 
 func (r *Registry) Call(name string, raw json.RawMessage) string {
+	out, _ := r.CallWithFullResult(name, raw)
+	return out
+}
+
+func (r *Registry) CallWithFullResult(name string, raw json.RawMessage) (string, string) {
 	var res Result
 	switch name {
 	case "list_files":
@@ -172,13 +177,15 @@ func (r *Registry) Call(name string, raw json.RawMessage) string {
 	}
 	data, err := json.MarshalIndent(res, "", "  ")
 	if err != nil {
-		return fmt.Sprintf(`{"ok":false,"error":%q}`, err.Error())
+		out := fmt.Sprintf(`{"ok":false,"error":%q}`, err.Error())
+		return out, out
 	}
 	out := string(data)
+	full := out
 	if r.maxToolResultChars > 0 && len(out) > r.maxToolResultChars {
 		out = out[:r.maxToolResultChars] + "\n...truncated..."
 	}
-	return out
+	return out, full
 }
 
 func IsKnownTool(name string) bool {

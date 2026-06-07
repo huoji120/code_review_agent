@@ -16,13 +16,17 @@ import (
 )
 
 type Agent struct {
-	cfg             config.Config
-	prompts         prompt.Prompts
-	client          llm.Client
-	compressClient  llm.Client
-	tools           *tools.Registry
-	messages        []llm.Message
-	pendingEndAudit bool
+	cfg               config.Config
+	prompts           prompt.Prompts
+	client            llm.Client
+	compressClient    llm.Client
+	tools             *tools.Registry
+	messages          []llm.Message
+	pendingEndAudit   bool
+	trace             *traceLog
+	tracePath         string
+	traceErr          error
+	traceBootstrapped bool
 }
 
 type Event struct {
@@ -136,9 +140,77 @@ func (a *Agent) LoadedSkills() []string {
 	return a.prompts.LoadedSkillNames()
 }
 
+func (a *Agent) TracePath() string {
+	if a.trace != nil {
+		return a.trace.Path()
+	}
+	return a.tracePath
+}
+
+func (a *Agent) ensureTrace() (*traceLog, error) {
+	if !a.cfg.Agent.LogSession {
+		return nil, nil
+	}
+	if a.trace != nil {
+		return a.trace, nil
+	}
+	var (
+		log *traceLog
+		err error
+	)
+	if a.tracePath != "" {
+		log, err = resumeTraceLog(a.tracePath)
+	} else {
+		log, err = newTraceLog(a.cfg.Agent.LogSessionDir)
+	}
+	if err != nil {
+		a.traceErr = err
+		return nil, err
+	}
+	a.trace = log
+	a.tracePath = log.Path()
+	a.traceErr = nil
+	return log, nil
+}
+
+func (a *Agent) bootstrapTrace() {
+	log, err := a.ensureTrace()
+	if err != nil || log == nil || a.traceBootstrapped {
+		return
+	}
+	if log.IsNewFile() {
+		for _, msg := range a.messages {
+			if err := log.AppendMessage(msg); err != nil {
+				a.traceErr = err
+				return
+			}
+		}
+	}
+	a.traceBootstrapped = true
+}
+
+func (a *Agent) appendTraceMessage(message llm.Message) {
+	if !a.cfg.Agent.LogSession {
+		return
+	}
+	if !a.traceBootstrapped {
+		a.bootstrapTrace()
+	}
+	log, err := a.ensureTrace()
+	if err != nil || log == nil {
+		return
+	}
+	if err := log.AppendMessage(message); err != nil {
+		a.traceErr = err
+	}
+}
+
 func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 	a.sanitizeMessages()
-	a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: a.render("initial_audit_instruction", map[string]string{"input": input, "review_state": a.tools.ReviewPrompt(160)})})
+	a.bootstrapTrace()
+	userMessage := llm.Message{Role: llm.RoleUser, Content: a.render("initial_audit_instruction", map[string]string{"input": input, "review_state": a.tools.ReviewPrompt(160)})}
+	a.messages = append(a.messages, userMessage)
+	a.appendTraceMessage(userMessage)
 	a.emitState(emit)
 	for turn := 1; ; turn++ {
 		if ctx.Err() != nil {
@@ -166,18 +238,24 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 			emit(Event{Kind: "error", Content: err.Error()})
 			return
 		}
-		a.messages = append(a.messages, llm.Message{Role: llm.RoleAssistant, Content: answer})
+		assistantMessage := llm.Message{Role: llm.RoleAssistant, Content: answer}
+		a.messages = append(a.messages, assistantMessage)
+		a.appendTraceMessage(assistantMessage)
 		emit(Event{Kind: "assistant_done"})
 
 		call, ok := parseToolCall(answer)
 		if !ok {
-			a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: a.render("no_tool_retry", nil)})
+			retryMessage := llm.Message{Role: llm.RoleUser, Content: a.render("no_tool_retry", nil)}
+			a.messages = append(a.messages, retryMessage)
+			a.appendTraceMessage(retryMessage)
 			continue
 		}
 		if call.Name == "end_audit" {
 			if blocker := a.endAuditNeedsConfirmation(); blocker != "" {
 				emit(Event{Kind: "tool", Content: "end_audit 需要二次确认：仍有未完全审计文件"})
-				a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: blocker})
+				blockerMessage := llm.Message{Role: llm.RoleUser, Content: blocker}
+				a.messages = append(a.messages, blockerMessage)
+				a.appendTraceMessage(blockerMessage)
 				continue
 			}
 			emit(Event{Kind: "tool", Content: "AI 调用了审计完成工具 end_audit"})
@@ -185,10 +263,14 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 			a.pendingEndAudit = false
 			emit(Event{Kind: "tool", Content: fmt.Sprintf("calling %s", call.Name)})
 		}
-		result := a.callTool(ctx, emit, call)
-		a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + result})
+		result, fullResult := a.callTool(ctx, emit, call)
+		toolMessage := llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + result}
+		a.messages = append(a.messages, toolMessage)
+		a.appendTraceMessage(llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + fullResult})
 		if !tools.IsKnownTool(call.Name) {
-			a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: a.unknownToolCorrection(call.Name)})
+			correctionMessage := llm.Message{Role: llm.RoleUser, Content: a.unknownToolCorrection(call.Name)}
+			a.messages = append(a.messages, correctionMessage)
+			a.appendTraceMessage(correctionMessage)
 		}
 		emit(Event{Kind: "tool", Content: a.displayToolResult(call.Name, result)})
 		a.emitState(emit)
@@ -209,14 +291,16 @@ func (a *Agent) unknownToolCorrection(name string) string {
 	return b.String()
 }
 
-func (a *Agent) callTool(ctx context.Context, emit func(Event), call ToolCall) string {
+func (a *Agent) callTool(ctx context.Context, emit func(Event), call ToolCall) (string, string) {
 	if call.Name == "load_skill" {
-		return a.loadSkill(call.Arguments)
+		result := a.loadSkill(call.Arguments)
+		return result, result
 	}
 	if call.Name == "verify_finding" {
-		return a.verifyFinding(ctx, emit, call.Arguments)
+		result := a.verifyFinding(ctx, emit, call.Arguments)
+		return result, result
 	}
-	return a.tools.Call(call.Name, call.Arguments)
+	return a.tools.CallWithFullResult(call.Name, call.Arguments)
 }
 
 type verifyFindingArgs struct {
@@ -278,7 +362,7 @@ func (a *Agent) verifyFinding(ctx context.Context, emit func(Event), raw json.Ra
 	registry.RestoreSnapshot(a.tools.Snapshot())
 	childPrompts := a.prompts
 	childPrompts.SetLoadedSkills(a.prompts.LoadedSkillNames())
-	child := &Agent{cfg: a.cfg, prompts: childPrompts, client: a.client, tools: registry}
+	child := &Agent{cfg: a.cfg, prompts: childPrompts, client: a.client, compressClient: a.compressClient, tools: registry}
 	child.messages = []llm.Message{{Role: llm.RoleSystem, Content: child.systemPrompt()}}
 	if emit != nil {
 		emit(Event{Kind: "verify_progress", VerifyTitle: args.Title, VerifyTurn: 0, VerifyLimit: child.verificationTurnLimit(), VerifyStatus: "准备验证"})
@@ -359,7 +443,7 @@ func (a *Agent) runVerification(ctx context.Context, emit func(Event), args veri
 			}
 			continue
 		}
-		result := a.tools.Call(call.Name, call.Arguments)
+		result, _ := a.callTool(ctx, emit, call)
 		a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + result})
 	}
 	if emit != nil {
@@ -622,12 +706,13 @@ func (a *Agent) chatStreamOnce(ctx context.Context, emit func(Event)) (string, e
 		}
 		return nil
 	})
+	answer := joinAssistantMessage(fullThinking.String(), fullContent.String())
 	if ctx.Err() != nil {
-		return joinAssistantMessage(fullThinking.String(), fullContent.String()), ctx.Err()
+		return answer, ctx.Err()
 	}
 	flush()
 	parser.Flush()
-	return joinAssistantMessage(fullThinking.String(), fullContent.String()), err
+	return answer, err
 }
 
 func (a *Agent) chatCurrentWithRetry(ctx context.Context, emit func(Event)) (string, error) {

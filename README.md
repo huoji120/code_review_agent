@@ -23,6 +23,10 @@ prompts:
 agent:
   max_turns: 0
   summary_interval: 66
+  auto_save_interval: 5
+  session_dir: sessions
+  log_session: false
+  log_session_dir: log_sessions
   retry_attempts: 3
   compress_at_ratio: 0.70
   compress_buffer_tokens: 393216
@@ -57,6 +61,8 @@ agent:
   summary_interval: 30
   auto_save_interval: 5
   session_dir: sessions
+  log_session: false
+  log_session_dir: log_sessions
   retry_attempts: 3
   compress_at_ratio: 0.75
   compress_buffer_tokens: 8192
@@ -64,6 +70,7 @@ agent:
   max_tool_result_chars: 12000
 
 ```
+如果需要完整记录模型会话轨迹，把 `agent.log_session` 改成 `true`。程序会在 `agent.log_session_dir` 下为每个会话创建一个 `.json` 文件，内容是严格 ChatML 消息数组：`[{"role":"system","content":"..."},{"role":"user","content":"..."},{"role":"assistant","content":"..."}]`，按真实顺序持续 append。assistant 的 `<think>` 会保留在 `content` 内，工具调用保留在 assistant 的 `content` 内，工具返回作为下一条 `user` 消息写入，并使用未被 `max_tool_result_chars` 截断的完整结果。保存到 `sessions` 的会话文件会记录 `trace_path`，后续 `/restore` 恢复后会继续追加到同一个 trace 文件。
 使用方法,进去后直接输入项目路径按下即可,只支持windows. 
 
 ![img](img/1.png)
