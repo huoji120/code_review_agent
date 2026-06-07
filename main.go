@@ -10,12 +10,15 @@ import (
 	"code-review-agent/internal/agent"
 	"code-review-agent/internal/config"
 	"code-review-agent/internal/llm"
+	"code-review-agent/internal/paniclog"
 	"code-review-agent/internal/prompt"
 	"code-review-agent/internal/tools"
 	"code-review-agent/internal/tui"
 )
 
 func main() {
+	defer paniclog.RecoverWithContext("main")
+
 	cfgPath := flag.String("config", "config.yaml", "config file path")
 	auditDir := flag.String("dir", "", "directory to audit")
 	flag.Parse()

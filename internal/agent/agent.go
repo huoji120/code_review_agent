@@ -886,9 +886,11 @@ func removeThinkBlocks(content string) string {
 		if start < 0 {
 			return content
 		}
-		end := strings.Index(content[start+len("<think>"):], "</think>")
+		rest := content[start+len("<think>"):]
+		end := strings.Index(rest, "</think>")
 		if end < 0 {
-			return content
+			// Drop an unfinished thinking block before compression.
+			return content[:start]
 		}
 		end += start + len("<think>") + len("</think>")
 		content = content[:start] + content[end:]

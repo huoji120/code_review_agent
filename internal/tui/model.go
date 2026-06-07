@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"code-review-agent/internal/config"
+	"code-review-agent/internal/paniclog"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -667,6 +668,8 @@ func (m Model) runQuery(query string) (tea.Model, tea.Cmd) {
 	m.done = make(chan struct{})
 	events := m.events
 	go func() {
+		defer paniclog.RecoverWithContext("agent runner")
+
 		m.runner.Run(ctx, query, func(e agent.Event) {
 			select {
 			case events <- e:
