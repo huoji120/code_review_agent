@@ -11,11 +11,12 @@ import (
 )
 
 type Prompts struct {
-	System    string
-	Compress  string
-	Skills    []Skill
-	loaded    []string
-	Templates map[string]string
+	System     string
+	PlanSystem string
+	Compress   string
+	Skills     []Skill
+	loaded     []string
+	Templates  map[string]string
 }
 
 type Skill struct {
@@ -25,6 +26,10 @@ type Skill struct {
 
 func Load(cfg config.PromptConfig) (Prompts, error) {
 	system, err := os.ReadFile(cfg.System)
+	if err != nil {
+		return Prompts{}, err
+	}
+	planSystem, err := os.ReadFile(cfg.PlanSystem)
 	if err != nil {
 		return Prompts{}, err
 	}
@@ -40,7 +45,7 @@ func Load(cfg config.PromptConfig) (Prompts, error) {
 	if err != nil {
 		return Prompts{}, err
 	}
-	return Prompts{System: string(system), Compress: string(compress), Skills: skills, Templates: templates}, nil
+	return Prompts{System: string(system), PlanSystem: string(planSystem), Compress: string(compress), Skills: skills, Templates: templates}, nil
 }
 
 func (p Prompts) RenderTemplate(name string, vars map[string]string) string {
@@ -52,8 +57,16 @@ func (p Prompts) RenderTemplate(name string, vars map[string]string) string {
 }
 
 func (p Prompts) SystemWithSkills() string {
+	return p.systemWithSkills(p.System)
+}
+
+func (p Prompts) PlanSystemWithSkills() string {
+	return p.systemWithSkills(p.PlanSystem)
+}
+
+func (p Prompts) systemWithSkills(system string) string {
 	var b strings.Builder
-	b.WriteString(p.System)
+	b.WriteString(system)
 	if len(p.Skills) > 0 {
 		b.WriteString("\n\n# Available Skills\n")
 		b.WriteString("如需使用某个 skill，必须先调用 `load_skill`。你可以按需加载多个不同 skill 并组合使用；加载后不要重复加载同一个 skill。可用 skills：\n")

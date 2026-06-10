@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ type Agent struct {
 	client            llm.Client
 	compressClient    llm.Client
 	tools             *tools.Registry
+	phase             string
 	messages          []llm.Message
 	pendingEndAudit   bool
 	trace             *traceLog
@@ -29,9 +31,15 @@ type Agent struct {
 	traceBootstrapped bool
 }
 
+const (
+	phasePlan    = "plan"
+	phaseExecute = "execute"
+)
+
 type Event struct {
 	Kind         string
 	Content      string
+	Phase        string
 	Skills       []string
 	VerifyTitle  string
 	VerifyTurn   int
@@ -39,6 +47,7 @@ type Event struct {
 	VerifyStatus string
 	Todos        []tools.Todo
 	Findings     []tools.Finding
+	Project      tools.ProjectNote
 	Files        []tools.FileReview
 	Variables    []tools.VariableReview
 	Flows        []tools.FlowReview
@@ -58,7 +67,7 @@ func NewWithCompressClient(cfg config.Config, prompts prompt.Prompts, client llm
 	if compressClient == nil {
 		compressClient = client
 	}
-	a := &Agent{cfg: cfg, prompts: prompts, client: client, compressClient: compressClient, tools: registry}
+	a := &Agent{cfg: cfg, prompts: prompts, client: client, compressClient: compressClient, tools: registry, phase: phasePlan}
 	a.messages = []llm.Message{{Role: llm.RoleSystem, Content: a.systemPrompt()}}
 	return a
 }
@@ -88,6 +97,9 @@ func (a *Agent) sanitizeMessages() {
 }
 
 func (a *Agent) systemPrompt() string {
+	if a.phase == phasePlan {
+		return a.planSystemPrompt()
+	}
 	system := a.prompts.SystemWithSkills()
 	system += "\n\n" + a.tools.GitPrompt()
 	system += "\n\n" + a.tools.ToolPrompt()
@@ -98,6 +110,45 @@ func (a *Agent) systemPrompt() string {
 	system += "\n\n" + a.render("summary_interval", map[string]string{"summary_interval": fmt.Sprint(a.cfg.Agent.SummaryInterval)})
 	system += "\n\n" + a.render("tool_protocol_guard", nil)
 	return system
+}
+
+func (a *Agent) planSystemPrompt() string {
+	system := a.prompts.PlanSystemWithSkills()
+	system += "\n\n" + a.planWorkspacePrompt()
+	system += "\n\n" + a.planToolPrompt()
+	system += "\n\n" + a.skillToolPrompt()
+	system += "\n\n" + a.render("summary_interval", map[string]string{"summary_interval": fmt.Sprint(a.cfg.Agent.SummaryInterval)})
+	system += "\n\n" + a.render("tool_protocol_guard", nil)
+	return system
+}
+
+func (a *Agent) planWorkspacePrompt() string {
+	return "# 当前工作区\n\n- 工作区：" + filepath.ToSlash(a.tools.Workspace()) + "\n- 规划阶段不会暴露 Git 审计工具；如需增量审计、blame 或 diff，必须等切换到执行阶段后再使用。"
+}
+
+func (a *Agent) planToolPrompt() string {
+	return `# 规划阶段工具协议
+
+每次只能调用一个工具。工具调用必须使用下面格式：
+
+<tool_call>
+{"name":"tool_name","arguments":{"key":"value"}}
+</tool_call>
+
+规划阶段只允许使用这些工具：
+
+- review_state：查看当前文件清单、todo、项目笔记、文件地图、变量和 flow 状态。参数：limit。
+- list_files：按目录、深度或模式补充文件地图。参数：root、pattern、max_depth、include_hidden、limit。
+- read_file：只读取配置、入口、路由、鉴权、依赖描述等少量关键文件用于建图，不做漏洞结论。参数：path、offset、limit。
+- search_content：搜索用于建图的关键词，例如 route、controller、auth、upload、admin、plugin、template、config、action。参数：query、mode、root、include、limit、case_insensitive、case_sensitive。
+- todo_create：创建执行阶段必须审计的具体 todo。todo 必须绑定地图优先级、具体文件/模块/入口/变量/审计点。
+- todo_update：修正规划阶段 todo。参数：id、status、title、priority。
+- file_review_update：绘制本次 one-shot 文件地图。文件排查默认为空，必须由你显式选择文件加入。支持 path 单文件、paths 多文件、dir/dirs + suffix/suffixes、pattern/patterns 从本地 inventory 批量加入。只能把文件标记为 reviewing 或 skipped，不要在规划阶段标记 reviewed。note 写明为什么纳入 one-shot 审计范围或为什么跳过。
+- project_note_update：更新项目级详细自由文本笔记。参数：note。必须像人工审计员工作笔记一样尽量详细，主动记录项目架构、运行行为、登录认证、鉴权机制、攻击面、数据/状态流、关键文件角色、已知结论和待确认问题；每次获得新信息后都应更新，不要只写摘要。
+- audit_plan_done：规划完成并切换到执行阶段。参数：summary、audit_map、audit_files、execute_instructions。audit_files 必须是本次 one-shot 执行阶段要审计的具体文件路径列表。
+- load_skill：按需加载 skill。参数：name。
+
+规划阶段禁止调用 verify_finding、report_finding、end_audit、flow_review_update、flow_review_delete、variable_review_update。规划阶段不能提交漏洞、不能结束审计、不能把猜测当证据。`
 }
 
 func (a *Agent) skillToolPrompt() string {
@@ -138,6 +189,13 @@ func (a *Agent) Snapshot() tools.Snapshot {
 
 func (a *Agent) LoadedSkills() []string {
 	return a.prompts.LoadedSkillNames()
+}
+
+func (a *Agent) Phase() string {
+	if a.phase == "" {
+		return phasePlan
+	}
+	return a.phase
 }
 
 func (a *Agent) TracePath() string {
@@ -208,7 +266,14 @@ func (a *Agent) appendTraceMessage(message llm.Message) {
 func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 	a.sanitizeMessages()
 	a.bootstrapTrace()
-	userMessage := llm.Message{Role: llm.RoleUser, Content: a.render("initial_audit_instruction", map[string]string{"input": input, "review_state": a.tools.ReviewPrompt(160)})}
+	if a.phase == "" {
+		a.phase = phasePlan
+	}
+	initialTemplate := "initial_audit_instruction"
+	if a.phase == phasePlan {
+		initialTemplate = "initial_plan_instruction"
+	}
+	userMessage := llm.Message{Role: llm.RoleUser, Content: a.render(initialTemplate, map[string]string{"input": input, "review_state": a.tools.ReviewPrompt(200)})}
 	a.messages = append(a.messages, userMessage)
 	a.appendTraceMessage(userMessage)
 	a.emitState(emit)
@@ -263,7 +328,26 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 			a.pendingEndAudit = false
 			emit(Event{Kind: "tool", Content: fmt.Sprintf("calling %s", call.Name)})
 		}
+		if correction := a.phaseToolCorrection(call.Name); correction != "" {
+			correctionMessage := llm.Message{Role: llm.RoleUser, Content: correction}
+			a.messages = append(a.messages, correctionMessage)
+			a.appendTraceMessage(correctionMessage)
+			continue
+		}
 		result, fullResult := a.callTool(ctx, emit, call)
+		if call.Name == "audit_plan_done" {
+			emit(Event{Kind: "tool", Content: result})
+			if auditPlanAccepted(result) {
+				a.switchToExecute(call.Arguments, result)
+				a.emitState(emit)
+				continue
+			}
+			toolMessage := llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + result}
+			a.messages = append(a.messages, toolMessage)
+			a.appendTraceMessage(toolMessage)
+			a.emitState(emit)
+			continue
+		}
 		toolMessage := llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + result}
 		a.messages = append(a.messages, toolMessage)
 		a.appendTraceMessage(llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + fullResult})
@@ -281,6 +365,24 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 	}
 }
 
+func (a *Agent) phaseToolCorrection(name string) string {
+	if a.phase == phasePlan {
+		if len(a.prompts.LoadedSkillNames()) == 0 && name != "load_skill" {
+			return "当前处于规划建图阶段，且尚未加载任何 skill。首次启动审计必须先根据项目文件类型和 Inventory 摘要选择并调用 load_skill 加载至少一个 skill，然后才能继续 review_state/list_files/read_file/search_content/todo/file_review/audit_plan_done。下一条回复只能输出一个 load_skill 的 <tool_call> JSON。"
+		}
+		switch name {
+		case "review_state", "list_files", "read_file", "search_content", "search_context", "todo_create", "todo_update", "file_review_update", "project_note_update", "audit_plan_done", "load_skill":
+			return ""
+		default:
+			return "当前处于规划建图阶段，禁止调用 " + name + "。你必须继续绘制审计地图、创建具体 todo、标记本次 one-shot 要审计的文件；规划完成后只能调用 audit_plan_done 切换到执行阶段。下一条回复只能输出一个合法 <tool_call> JSON。"
+		}
+	}
+	if name == "audit_plan_done" {
+		return "当前已经处于执行审计阶段，不能再次调用 audit_plan_done。请按规划阶段产出的审计地图继续 read_file/search_content/flow_review_update/verify_finding/report_finding。下一条回复只能输出一个合法 <tool_call> JSON。"
+	}
+	return ""
+}
+
 func (a *Agent) unknownToolCorrection(name string) string {
 	var b strings.Builder
 	b.WriteString("你刚才调用了不存在的工具：")
@@ -296,11 +398,76 @@ func (a *Agent) callTool(ctx context.Context, emit func(Event), call ToolCall) (
 		result := a.loadSkill(call.Arguments)
 		return result, result
 	}
+	if call.Name == "audit_plan_done" {
+		result := a.auditPlanDone(call.Arguments)
+		return result, result
+	}
 	if call.Name == "verify_finding" {
 		result := a.verifyFinding(ctx, emit, call.Arguments)
 		return result, result
 	}
 	return a.tools.CallWithFullResult(call.Name, call.Arguments)
+}
+
+type auditPlanDoneArgs struct {
+	Summary             string   `json:"summary"`
+	AuditMap            string   `json:"audit_map"`
+	AuditFiles          []string `json:"audit_files"`
+	ExecuteInstructions string   `json:"execute_instructions"`
+}
+
+func (a *Agent) auditPlanDone(raw json.RawMessage) string {
+	if len(a.prompts.LoadedSkillNames()) == 0 {
+		data, _ := json.MarshalIndent(tools.Result{OK: false, Error: "plan phase must load at least one skill before audit_plan_done"}, "", "  ")
+		return string(data)
+	}
+	args, err := decodeAuditPlanDoneArgs(raw)
+	if err != nil {
+		data, _ := json.MarshalIndent(tools.Result{OK: false, Error: err.Error()}, "", "  ")
+		return string(data)
+	}
+	applied := a.tools.ApplyAuditScope(args.AuditFiles)
+	if len(applied) == 0 {
+		data, _ := json.MarshalIndent(tools.Result{OK: false, Error: "audit_files did not match any files in the current workspace; use exact relative paths from review_state/list_files/search_content"}, "", "  ")
+		return string(data)
+	}
+	data, _ := json.MarshalIndent(tools.Result{OK: true, Data: map[string]any{"summary": args.Summary, "audit_map": args.AuditMap, "audit_files": applied, "execute_instructions": args.ExecuteInstructions}, Message: "audit plan accepted; switching to execute phase"}, "", "  ")
+	return string(data)
+}
+
+func auditPlanAccepted(result string) bool {
+	var parsed struct {
+		OK bool `json:"ok"`
+	}
+	return json.Unmarshal([]byte(result), &parsed) == nil && parsed.OK
+}
+
+func decodeAuditPlanDoneArgs(raw json.RawMessage) (auditPlanDoneArgs, error) {
+	var args auditPlanDoneArgs
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return args, err
+	}
+	if strings.TrimSpace(args.Summary) == "" {
+		return args, fmt.Errorf("summary is required")
+	}
+	if strings.TrimSpace(args.AuditMap) == "" {
+		return args, fmt.Errorf("audit_map is required")
+	}
+	if len(args.AuditFiles) == 0 {
+		return args, fmt.Errorf("audit_files must include concrete files selected for execute phase")
+	}
+	return args, nil
+}
+
+func (a *Agent) switchToExecute(raw json.RawMessage, result string) {
+	a.phase = phaseExecute
+	a.pendingEndAudit = false
+	a.sanitizeMessages()
+	a.messages = []llm.Message{
+		{Role: llm.RoleSystem, Content: a.systemPrompt()},
+		{Role: llm.RoleUser, Content: a.render("execute_after_plan", map[string]string{"plan_result": result, "review_state": a.tools.ReviewPrompt(240)})},
+	}
+	a.appendTraceMessage(llm.Message{Role: llm.RoleUser, Content: "Switched to execute phase after audit_plan_done. Raw plan arguments:\n" + string(raw)})
 }
 
 type verifyFindingArgs struct {
@@ -594,7 +761,7 @@ func formatEndAuditResult(result string) string {
 
 func (a *Agent) emitState(emit func(Event)) {
 	snapshot := a.tools.Snapshot()
-	emit(Event{Kind: "state", Skills: a.prompts.LoadedSkillNames(), Todos: snapshot.Todos, Findings: snapshot.Findings, Files: snapshot.Files, Variables: snapshot.Variables, Flows: snapshot.Flows, Audit: snapshot.Audit})
+	emit(Event{Kind: "state", Phase: a.Phase(), Skills: a.prompts.LoadedSkillNames(), Todos: snapshot.Todos, Findings: snapshot.Findings, Project: snapshot.Project, Files: snapshot.Files, Variables: snapshot.Variables, Flows: snapshot.Flows, Audit: snapshot.Audit})
 }
 
 func (a *Agent) formatFinalFindings() string {
@@ -854,11 +1021,15 @@ func (a *Agent) compressMessages(ctx context.Context, emit func(Event), reason s
 	if err != nil {
 		return err
 	}
+	resumeTemplate := "resume_after_compress"
+	if a.phase == phasePlan {
+		resumeTemplate = "plan_resume_after_compress"
+	}
 	a.messages = []llm.Message{
 		{Role: llm.RoleSystem, Content: a.systemPrompt()},
 		{Role: llm.RoleAssistant, Content: "Compressed audit context:\n" + compressed},
 		{Role: llm.RoleUser, Content: a.render("state_after_compress", map[string]string{"state": a.statePrompt(240)})},
-		{Role: llm.RoleUser, Content: a.render("resume_after_compress", map[string]string{"summary_interval": fmt.Sprint(a.cfg.Agent.SummaryInterval)})},
+		{Role: llm.RoleUser, Content: a.render(resumeTemplate, map[string]string{"summary_interval": fmt.Sprint(a.cfg.Agent.SummaryInterval)})},
 	}
 	emit(Event{Kind: "ui_compact", Content: "## 上下文已压缩\n\n" + compressed})
 	a.emitState(emit)
@@ -908,6 +1079,13 @@ func omitToolResultForCompression(content string) string {
 func (a *Agent) statePrompt(limit int) string {
 	var b strings.Builder
 	b.WriteString("# 当前审计状态快照\n\n")
+	b.WriteString("## 当前阶段\n")
+	b.WriteString("- phase: ")
+	b.WriteString(a.phase)
+	b.WriteString("\n\n")
+	b.WriteString("## 项目笔记\n")
+	b.WriteString(formatAgentProjectNote(a.tools.ProjectNote()))
+	b.WriteString("\n")
 	audit := a.tools.Audit()
 	b.WriteString("## 审计结束状态\n")
 	b.WriteString(fmt.Sprintf("- ended: %v\n", audit.Ended))
@@ -950,6 +1128,13 @@ func (a *Agent) statePrompt(limit int) string {
 	b.WriteString("\n")
 	b.WriteString(a.tools.ReviewPrompt(limit))
 	return b.String()
+}
+
+func formatAgentProjectNote(note tools.ProjectNote) string {
+	if strings.TrimSpace(note.Note) == "" {
+		return "暂无项目笔记。规划阶段必须调用 project_note_update 维护详细自由文本笔记；压缩后也会保留并要求继续更新。\n"
+	}
+	return note.Note + "\n"
 }
 
 func estimateTokens(messages []llm.Message) int {

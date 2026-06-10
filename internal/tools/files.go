@@ -228,7 +228,7 @@ func (r *Registry) inventoryBaseMatches(input string) []string {
 		return nil
 	}
 	var matches []string
-	for _, file := range r.files {
+	for _, file := range r.inventory {
 		if strings.EqualFold(pathpkg.Base(file.Path), base) {
 			matches = append(matches, file.Path)
 		}

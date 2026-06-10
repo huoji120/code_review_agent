@@ -64,7 +64,7 @@ func (r *Registry) fileReviewUpdate(raw json.RawMessage) Result {
 	if err != nil {
 		return Result{OK: false, Error: err.Error()}
 	}
-	items := normalizeFileReviewItemsWithRegistry(args, r.files)
+	items := r.normalizeFileReviewItems(args)
 	if len(items) > 1 {
 		return r.fileReviewUpdateBatch(items)
 	}
@@ -142,6 +142,56 @@ func normalizeFileReviewItemsWithRegistry(args fileReviewUpdateArgs, files []Fil
 		items = append(items, fileReviewUpdateItem{Path: filePath, Status: args.Status, Note: args.Note})
 	}
 	return items
+}
+
+func (r *Registry) normalizeFileReviewItems(args fileReviewUpdateArgs) []fileReviewUpdateItem {
+	items := normalizeFileReviewItems(args)
+	if len(items) > 0 || !hasFileReviewSelectors(args) {
+		for i := range items {
+			items[i].Path = normalizeInventoryPath(items[i].Path)
+		}
+		return items
+	}
+	selectorPaths := r.selectInventoryPathsByFileReviewArgs(args)
+	items = make([]fileReviewUpdateItem, 0, len(selectorPaths))
+	for _, filePath := range selectorPaths {
+		items = append(items, fileReviewUpdateItem{Path: filePath, Status: args.Status, Note: args.Note})
+	}
+	return items
+}
+
+func (r *Registry) selectInventoryPathsByFileReviewArgs(args fileReviewUpdateArgs) []string {
+	dirs := append([]string(nil), args.Dirs...)
+	if args.Dir != "" {
+		dirs = append(dirs, args.Dir)
+	}
+	suffixes := append([]string(nil), args.Suffixes...)
+	if args.Suffix != "" {
+		suffixes = append(suffixes, args.Suffix)
+	}
+	patterns := append([]string(nil), args.Patterns...)
+	if args.Pattern != "" {
+		patterns = append(patterns, args.Pattern)
+	}
+	for i := range dirs {
+		dirs[i] = normalizeSelectorDir(dirs[i])
+	}
+	for i := range suffixes {
+		suffixes[i] = normalizeSelectorSuffix(suffixes[i])
+	}
+	seen := map[string]struct{}{}
+	var paths []string
+	for _, file := range r.inventory {
+		if !matchesFileSelectors(file.Path, dirs, suffixes, patterns) {
+			continue
+		}
+		if _, ok := seen[file.Path]; ok {
+			continue
+		}
+		seen[file.Path] = struct{}{}
+		paths = append(paths, file.Path)
+	}
+	return paths
 }
 
 func hasFileReviewSelectors(args fileReviewUpdateArgs) bool {

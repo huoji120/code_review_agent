@@ -41,6 +41,7 @@ type Model struct {
 	sideScroll     int
 	todos          []tools.Todo
 	findings       []tools.Finding
+	projectNote    tools.ProjectNote
 	files          []tools.FileReview
 	filesExpanded  bool
 	variables      []tools.VariableReview
@@ -63,6 +64,7 @@ type Model struct {
 	turnCount      int
 	saveCheckpoint int
 	workspaceReady bool
+	phase          string
 	petState       string
 	petFrame       int
 	petAction      string
@@ -94,6 +96,7 @@ const welcomeHint = "代码审计 Agent。请输入要审计的目录。按 Ctrl
 
 const (
 	petIdle     = "idle"
+	petPlanning = "planning"
 	petThinking = "thinking"
 	petWriting  = "writing"
 	petTool     = "tool"
@@ -139,7 +142,7 @@ func New(runner *agent.Agent, cfg config.Config, autoDir string) Model {
 	input.Focus()
 	input.CharLimit = 4000
 	input.Width = 100
-	return Model{runner: runner, input: input, width: 120, height: 40, autoDir: autoDir, pane: "main", sessionDir: cfg.Agent.SessionDir, modelName: cfg.OpenAI.Model, autoSaveEvery: cfg.Agent.AutoSaveInterval, petState: petIdle}
+	return Model{runner: runner, input: input, width: 120, height: 40, autoDir: autoDir, pane: "main", sessionDir: cfg.Agent.SessionDir, modelName: cfg.OpenAI.Model, autoSaveEvery: cfg.Agent.AutoSaveInterval, phase: runner.Phase(), petState: petIdle}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -657,7 +660,11 @@ func (m Model) runQuery(query string) (tea.Model, tea.Cmd) {
 	m.turnCount++
 	m.trimLog()
 	m.busy = true
+	m.phase = m.runner.Phase()
 	m.petState = petThinking
+	if m.inPlanPhase() {
+		m.petState = petPlanning
+	}
 	m.petAction = ""
 	m.petActiveTool = ""
 	m.session++
@@ -783,10 +790,12 @@ func (m Model) restoreSession(path string) (tea.Model, tea.Cmd) {
 	snapshot := m.runner.Snapshot()
 	m.todos = snapshot.Todos
 	m.findings = snapshot.Findings
+	m.projectNote = snapshot.Project
 	m.files = snapshot.Files
 	m.variables = snapshot.Variables
 	m.flows = snapshot.Flows
 	m.audit = snapshot.Audit
+	m.phase = m.runner.Phase()
 	m.loadedSkills = m.runner.LoadedSkills()
 	m.workspaceReady = true
 	m.log = append(m.log, logEntry{Kind: "info", Content: "已恢复会话：" + path})
@@ -882,6 +891,7 @@ func formatFindingsList(findings []tools.Finding) string {
 func (m *Model) appendEvent(e agent.Event) {
 	switch e.Kind {
 	case "state":
+		m.phase = e.Phase
 		m.loadedSkills = e.Skills
 		if e.VerifyLimit > 0 {
 			m.verifyTitle = e.VerifyTitle
@@ -891,15 +901,28 @@ func (m *Model) appendEvent(e agent.Event) {
 		}
 		m.todos = e.Todos
 		m.findings = e.Findings
+		m.projectNote = e.Project
 		m.files = e.Files
 		m.variables = e.Variables
 		m.flows = e.Flows
 		m.audit = e.Audit
+		if m.busy && m.inPlanPhase() {
+			m.petState = petPlanning
+			if strings.TrimSpace(m.petAction) == "" {
+				m.petAction = "map"
+			}
+		} else if m.busy && m.petState == petPlanning {
+			m.petState = petThinking
+			m.petAction = ""
+		}
 		m.maybeAutoSaveCheckpoint()
 		return
 	case "assistant_delta", "think_delta", "tool_call_delta":
 		kind := strings.TrimSuffix(e.Kind, "_delta")
-		if !m.keepActiveToolPet(kind) {
+		if m.inPlanPhase() {
+			m.petState = petPlanning
+			m.updatePlanPetAction(kind, e.Content)
+		} else if !m.keepActiveToolPet(kind) {
 			m.petState = petStateForEventKind(kind)
 			isNewEntry := len(m.log) == 0 || m.log[len(m.log)-1].Kind != kind
 			m.updatePetActionForDelta(kind, e.Content, isNewEntry)
@@ -940,7 +963,11 @@ func (m *Model) appendEvent(e agent.Event) {
 		m.log = []logEntry{{Kind: "assistant", Content: e.Content}}
 	default:
 		if e.Kind == "tool" {
-			m.petState = petTool
+			if m.inPlanPhase() {
+				m.petState = petPlanning
+			} else {
+				m.petState = petTool
+			}
 			m.petAction = m.toolActionForEvent(e.Content)
 		} else if e.Kind == "error" {
 			m.petState = petStopped
@@ -950,6 +977,29 @@ func (m *Model) appendEvent(e agent.Event) {
 		m.log = append(m.log, logEntry{Kind: e.Kind, Content: e.Content})
 	}
 	m.trimLog()
+}
+
+func (m Model) inPlanPhase() bool {
+	return m.phase == "plan"
+}
+
+func (m *Model) updatePlanPetAction(kind, content string) {
+	switch kind {
+	case "tool_call", "tool":
+		if action, ok := toolActionFromContent(content); ok {
+			m.petAction = action
+			return
+		}
+	case "assistant":
+		m.petAction = "map"
+		return
+	case "think":
+		m.petAction = "plan"
+		return
+	}
+	if strings.TrimSpace(m.petAction) == "" {
+		m.petAction = "map"
+	}
 }
 
 func petStateForEventKind(kind string) string {
@@ -1057,6 +1107,10 @@ func toolActionFromContent(content string) (string, bool) {
 	content = strings.TrimSpace(content)
 	lowerContent := strings.ToLower(content)
 	switch {
+	case strings.Contains(lowerContent, "audit_plan_done"):
+		return "done", true
+	case strings.Contains(lowerContent, "list_files") || strings.Contains(lowerContent, "review_state"):
+		return "map", true
 	case strings.Contains(lowerContent, "read"):
 		return "read", true
 	case strings.Contains(lowerContent, "compress"):
@@ -1096,6 +1150,7 @@ func truncateASCII(text string, limit int) string {
 const maxLogEntries = 8
 const maxLogEntryChars = 6000
 const maxSidebarFilesCollapsed = 30
+const maxSidebarProjectNoteLines = 8
 
 func (m *Model) trimLog() {
 	if len(m.log) > maxLogEntries {
@@ -1163,7 +1218,7 @@ func (m Model) View() string {
 		footer := m.renderFooter(m.width)
 		return lipgloss.JoinVertical(lipgloss.Left, top, "", footer)
 	}
-	left := renderSidebar(m.loadedSkills, m.todos, m.findings, m.files, m.filesExpanded, m.variables, m.flows, sideWidth, topHeight, m.sideScroll, m.pane == "side", m.petContext())
+	left := renderSidebar(m.loadedSkills, m.todos, m.findings, m.projectNote, m.files, m.filesExpanded, m.variables, m.flows, sideWidth, topHeight, m.sideScroll, m.pane == "side", m.petContext())
 	top := renderColumns(left, main, sideWidth, contentWidth, topHeight)
 	footer := m.renderFooter(m.width)
 	return lipgloss.JoinVertical(lipgloss.Left, top, "", footer)
@@ -1364,6 +1419,28 @@ func truncateRunes(text string, maxLen int) string {
 	return string(runes[:maxLen]) + "..."
 }
 
+func projectNotePreviewLines(note string, width, maxLines int) []string {
+	note = strings.TrimSpace(stripANSI(note))
+	if note == "" || maxLines <= 0 {
+		return nil
+	}
+	var lines []string
+	for _, raw := range strings.Split(note, "\n") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		for _, wrapped := range wrapLine(raw, width) {
+			lines = append(lines, fitLine(wrapped, width))
+			if len(lines) >= maxLines {
+				lines[len(lines)-1] = fitLine(lines[len(lines)-1]+" ...", width)
+				return lines
+			}
+		}
+	}
+	return lines
+}
+
 func (m Model) pageSize() int {
 	return m.bodyHeight()
 }
@@ -1380,7 +1457,7 @@ func (m Model) maxScroll() int {
 func (m Model) maxSidebarScroll() int {
 	sideWidth, _ := m.panelWidths()
 	contentWidth := sidebarInnerWidth(sideWidth)
-	lines := sidebarLines(m.loadedSkills, m.todos, m.findings, m.files, m.filesExpanded, m.variables, m.flows, contentWidth)
+	lines := sidebarLines(m.loadedSkills, m.todos, m.findings, m.projectNote, m.files, m.filesExpanded, m.variables, m.flows, contentWidth)
 	listHeight := sidebarContentHeight(m.topPaneHeight()) - len(renderPetAreaLines(m.petContext(), contentWidth))
 	maxScroll := len(lines) - max(1, listHeight)
 	if maxScroll < 0 {
@@ -1390,7 +1467,7 @@ func (m Model) maxSidebarScroll() int {
 }
 
 func (m Model) visibleSidebarLines(contentWidth int) []string {
-	lines := sidebarLines(m.loadedSkills, m.todos, m.findings, m.files, m.filesExpanded, m.variables, m.flows, contentWidth)
+	lines := sidebarLines(m.loadedSkills, m.todos, m.findings, m.projectNote, m.files, m.filesExpanded, m.variables, m.flows, contentWidth)
 	contentHeight := max(1, sidebarContentHeight(m.topPaneHeight())-len(renderPetAreaLines(m.petContext(), contentWidth)))
 	if len(lines) > contentHeight {
 		start := min(m.sideScroll, len(lines)-contentHeight)
@@ -1638,7 +1715,7 @@ func findToolCallJSONObject(text string) (string, bool) {
 	return "", false
 }
 
-func renderSidebar(skills []string, todos []tools.Todo, findings []tools.Finding, files []tools.FileReview, filesExpanded bool, variables []tools.VariableReview, flows []tools.FlowReview, width, height, scroll int, focused bool, pet petRenderContext) string {
+func renderSidebar(skills []string, todos []tools.Todo, findings []tools.Finding, projectNote tools.ProjectNote, files []tools.FileReview, filesExpanded bool, variables []tools.VariableReview, flows []tools.FlowReview, width, height, scroll int, focused bool, pet petRenderContext) string {
 	if width <= 0 {
 		return ""
 	}
@@ -1646,7 +1723,7 @@ func renderSidebar(skills []string, todos []tools.Todo, findings []tools.Finding
 	contentHeight := sidebarContentHeight(height)
 	petLines := renderPetAreaLines(pet, contentWidth)
 	listHeight := max(1, contentHeight-len(petLines))
-	lines := sidebarLines(skills, todos, findings, files, filesExpanded, variables, flows, contentWidth)
+	lines := sidebarLines(skills, todos, findings, projectNote, files, filesExpanded, variables, flows, contentWidth)
 	if len(lines) > listHeight {
 		start := min(max(0, scroll), len(lines)-listHeight)
 		end := start + listHeight
@@ -1733,6 +1810,8 @@ func petArt(pet petRenderContext) ([]string, string) {
 			sprite("'-'", "?", ""), sprite("'-'", "??", ""), sprite("- -", "...", ""), sprite("'-'", "*?", ""),
 		}
 		return frames[phase], firstNonEmptyString(labelOverride, "思考中")
+	case petPlanning:
+		return catPlanSprite(action, variant, phase), firstNonEmptyString(labelOverride, "规划中")
 	case petWriting:
 		frames := [][]string{
 			sprite("o.o", "", " "+writeBadge), sprite("o.o", "", " /"+writeBadge), sprite("o.o", "", " "+writeBadge), sprite("- -", "", " /"+writeBadge),
@@ -1804,6 +1883,29 @@ func petToolArt(action, variant string, phase int) ([]string, string) {
 		return catReportFindingSprite(variant, phase), "提交漏洞"
 	}
 	return catGenericToolSprite(action, variant, phase), "调工具"
+}
+
+func catPlanSprite(action, variant string, phase int) []string {
+	prop := "map"
+	switch action {
+	case "todo":
+		prop = "todo"
+	case "read":
+		prop = "cfg"
+	case "grep":
+		prop = "idx"
+	case "done":
+		prop = "go!"
+	case "plan":
+		prop = "plan"
+	}
+	frames := [][]string{
+		append(catHeadLines("o.o", "", variant), ` /| [map]`, ` U-U(_/`),
+		append(catHeadLines("o.o", "", variant), ` [ ]-[ ]`, ` U-U(_/`),
+		append(catHeadLines("- -", "", variant), ` /| {`+prop+`}`, ` U-U(_/`),
+		append(catHeadLines("o.o", "", variant), ` [x]->[ ]`, ` U-U(_/`),
+	}
+	return frames[phase%len(frames)]
 }
 
 func catHeadLines(face, suffix, variant string) []string {
@@ -1929,7 +2031,7 @@ func centerPetBlock(lines []string, width int) []string {
 	return out
 }
 
-func sidebarLines(skills []string, todos []tools.Todo, findings []tools.Finding, files []tools.FileReview, filesExpanded bool, variables []tools.VariableReview, flows []tools.FlowReview, width int) []string {
+func sidebarLines(skills []string, todos []tools.Todo, findings []tools.Finding, projectNote tools.ProjectNote, files []tools.FileReview, filesExpanded bool, variables []tools.VariableReview, flows []tools.FlowReview, width int) []string {
 	var lines []string
 	appendLine := func(text string) {
 		lines = append(lines, renderSidebarLine(lipgloss.NewStyle(), text, width))
@@ -1948,6 +2050,16 @@ func sidebarLines(skills []string, todos []tools.Todo, findings []tools.Finding,
 	} else {
 		for _, skill := range skills {
 			appendWrapped(styleSuccess, skill)
+		}
+	}
+	appendLine("")
+
+	appendStyledLine(styleSidebarTitle, "项目笔记")
+	if strings.TrimSpace(projectNote.Note) == "" {
+		appendStyledLine(styleMuted, "暂无 project note")
+	} else {
+		for _, line := range projectNotePreviewLines(projectNote.Note, width, maxSidebarProjectNoteLines) {
+			appendStyledLine(styleMuted, line)
 		}
 	}
 	appendLine("")

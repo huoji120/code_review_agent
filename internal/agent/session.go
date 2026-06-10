@@ -14,6 +14,7 @@ import (
 type Session struct {
 	SavedAt   string         `json:"saved_at"`
 	Workspace string         `json:"workspace"`
+	Phase     string         `json:"phase,omitempty"`
 	Skills    []string       `json:"skills,omitempty"`
 	TracePath string         `json:"trace_path,omitempty"`
 	Messages  []llm.Message  `json:"messages"`
@@ -27,6 +28,7 @@ func (a *Agent) SaveSession(path string) error {
 	session := Session{
 		SavedAt:   time.Now().Format(time.RFC3339),
 		Workspace: a.tools.Workspace(),
+		Phase:     a.phase,
 		Skills:    a.prompts.LoadedSkillNames(),
 		TracePath: a.TracePath(),
 		Messages:  a.messages,
@@ -53,6 +55,10 @@ func (a *Agent) LoadSession(path string) error {
 			return fmt.Errorf("restore workspace %q: %w", session.Workspace, err)
 		}
 	}
+	if session.Phase == "" {
+		session.Phase = phaseExecute
+	}
+	a.phase = session.Phase
 	a.prompts.SetLoadedSkills(session.Skills)
 	a.messages = append([]llm.Message(nil), session.Messages...)
 	a.sanitizeMessages()

@@ -32,6 +32,7 @@ type OpenAIConfig struct {
 
 type PromptConfig struct {
 	System       string `yaml:"system"`
+	PlanSystem   string `yaml:"plan_system"`
 	Compress     string `yaml:"compress"`
 	SkillsDir    string `yaml:"skills_dir"`
 	TemplatesDir string `yaml:"templates_dir"`
@@ -119,6 +120,9 @@ func applyDefaults(cfg *Config) {
 	applyCompressOpenAIDefaults(cfg)
 	if cfg.Prompts.System == "" {
 		cfg.Prompts.System = "prompts/system.md"
+	}
+	if cfg.Prompts.PlanSystem == "" {
+		cfg.Prompts.PlanSystem = "prompts/plan_system.md"
 	}
 	if cfg.Prompts.Compress == "" {
 		cfg.Prompts.Compress = "prompts/compress.md"
