@@ -140,7 +140,7 @@ func (a *Agent) planToolPrompt() string {
 - review_state：查看当前文件清单、todo、项目笔记、文件地图、变量和 flow 状态。参数：limit。
 - list_files：按目录、深度或模式补充文件地图。参数：root、pattern、max_depth、include_hidden、limit。
 - read_file：只读取配置、入口、路由、鉴权、依赖描述等少量关键文件用于建图，不做漏洞结论。参数：path、offset、limit。
-- search_content：搜索用于建图的关键词，例如 route、controller、auth、upload、admin、plugin、template、config、action。参数：query、mode、root、include、limit、case_insensitive、case_sensitive。
+- search_content：搜索用于建图的关键词，例如 route、controller、auth、upload、admin、plugin、template、config、action。参数：query、mode、root、include、limit、case_insensitive、case_sensitive。mode 支持 literal、regex、fuzzy；literal 是默认模式，query 按普通字符串包含搜索，不解析 .*、|、\b 等正则语法；使用正则语法时必须显式传 mode:"regex"。
 - todo_create：创建执行阶段必须审计的具体 todo。todo 必须绑定地图优先级、具体文件/模块/入口/变量/审计点。
 - todo_update：修正规划阶段 todo。参数：id、status、title、priority。
 - file_review_update：绘制本次 one-shot 文件地图。文件排查默认为空，必须由你显式选择文件加入。支持 path 单文件、paths 多文件、dir/dirs + suffix/suffixes、pattern/patterns 从本地 inventory 批量加入。只能把文件标记为 reviewing 或 skipped，不要在规划阶段标记 reviewed。note 写明为什么纳入 one-shot 审计范围或为什么跳过。
