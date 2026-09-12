@@ -1,6 +1,8 @@
 package config
 
 import (
+	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -40,8 +42,6 @@ type PromptConfig struct {
 
 type AgentConfig struct {
 	MaxTurns             int     `yaml:"max_turns"`
-	SummaryInterval      int     `yaml:"summary_interval"`
-	AutoSaveInterval     int     `yaml:"auto_save_interval"`
 	SessionDir           string  `yaml:"session_dir"`
 	LogSession           bool    `yaml:"log_session"`
 	LogSessionDir        string  `yaml:"log_session_dir"`
@@ -50,6 +50,9 @@ type AgentConfig struct {
 	CompressBufferTokens int     `yaml:"compress_buffer_tokens"`
 	AutoPlan             bool    `yaml:"auto_plan"`
 	MaxToolResultChars   int     `yaml:"max_tool_result_chars"`
+	ReconAgents          int     `yaml:"recon_agents"`
+	AuditAgents          int     `yaml:"audit_agents"`
+	ForumWaitSeconds     int     `yaml:"forum_wait_seconds"`
 }
 
 func Load(path string) (Config, error) {
@@ -57,14 +60,100 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	// Seed required defaults before decoding so explicit zero remains invalid.
+	cfg := Config{
+		OpenAI: OpenAIConfig{MaxContextTokens: 32000, MaxOutputTokens: 4096},
+		Agent:  AgentConfig{CompressAtRatio: 0.75},
+	}
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
 		return Config{}, err
 	}
+	if err := document.Decode(&cfg); err != nil {
+		return Config{}, err
+	}
+	// Missing compressor limits inherit from the main model; explicit zero is
+	// an invalid limit, not an instruction to silently substitute a default.
+	if len(document.Content) > 0 {
+		root := document.Content[0]
+		for i := 0; i+1 < len(root.Content); i += 2 {
+			if root.Content[i].Value != "compress_openai" {
+				continue
+			}
+			section := root.Content[i+1]
+			for j := 0; j+1 < len(section.Content); j += 2 {
+				key := section.Content[j].Value
+				if (key == "max_context_tokens" && cfg.CompressOpenAI.MaxContextTokens <= 0) || (key == "max_output_tokens" && cfg.CompressOpenAI.MaxOutputTokens <= 0) {
+					return Config{}, fmt.Errorf("compress_openai.%s must be positive", key)
+				}
+			}
+		}
+	}
 	applyDefaults(&cfg)
+	if cfg.Agent.ReconAgents < 1 || cfg.Agent.ReconAgents > 32 || cfg.Agent.AuditAgents < 1 || cfg.Agent.AuditAgents > 32 {
+		return Config{}, fmt.Errorf("agent.recon_agents and agent.audit_agents must be between 1 and 32")
+	}
+	if cfg.Agent.ForumWaitSeconds < 1 || cfg.Agent.ForumWaitSeconds > 120 {
+		return Config{}, fmt.Errorf("agent.forum_wait_seconds must be between 1 and 120")
+	}
+	if cfg.Agent.MaxToolResultChars < 1024 || cfg.Agent.MaxToolResultChars > 65536 {
+		return Config{}, fmt.Errorf("agent.max_tool_result_chars must be between 1024 and 65536 (serialized UTF-8 bytes)")
+	}
+	if _, err := cfg.CompressionThreshold(); err != nil {
+		return Config{}, err
+	}
+	if _, err := cfg.CompressionInputBudget(); err != nil {
+		return Config{}, err
+	}
 	resolveAPIKey(&cfg.OpenAI)
 	resolveAPIKey(&cfg.CompressOpenAI)
 	return cfg, nil
+}
+
+// CompressionThreshold is an estimated-token admission limit, not tokenizer usage.
+// Tool results are bounded UTF-8 bytes; reserve one token per byte conservatively,
+// plus the notification allowance and message framing, independently of the ratio.
+func (cfg Config) CompressionThreshold() (int, error) {
+	context, output := cfg.OpenAI.MaxContextTokens, cfg.OpenAI.MaxOutputTokens
+	ratio := cfg.Agent.CompressAtRatio
+	if context <= 0 || output <= 0 || output >= context {
+		return 0, fmt.Errorf("openai token limits must be positive with output below context")
+	}
+	if math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio <= 0 || ratio >= 1 {
+		return 0, fmt.Errorf("agent.compress_at_ratio must be finite and strictly between 0 and 1")
+	}
+	if cfg.Agent.CompressBufferTokens < 0 || cfg.Agent.MaxToolResultChars < 0 || cfg.Agent.MaxToolResultChars > 65536 {
+		return 0, fmt.Errorf("compression reserve and tool result bounds are invalid")
+	}
+	toolBytes := cfg.Agent.MaxToolResultChars
+	if toolBytes < 1024 {
+		toolBytes = 1024
+	}
+	reserve := toolBytes + 2048 + 256
+	if cfg.Agent.CompressBufferTokens > reserve {
+		reserve = cfg.Agent.CompressBufferTokens
+	}
+	if reserve >= context-output {
+		return 0, fmt.Errorf("openai context cannot fit output plus compression/tool/notification reserve")
+	}
+	limit := context - output - reserve
+	ratioLimit := math.Floor(float64(context) * ratio)
+	if ratioLimit < float64(limit) {
+		limit = int(ratioLimit)
+	}
+	if limit < 1024 {
+		return 0, fmt.Errorf("effective compression threshold must leave at least 1024 estimated input tokens")
+	}
+	return limit, nil
+}
+
+// CompressionInputBudget reserves the configured summarizer output in full.
+func (cfg Config) CompressionInputBudget() (int, error) {
+	context, output := cfg.CompressOpenAI.MaxContextTokens, cfg.CompressOpenAI.MaxOutputTokens
+	if context <= 0 || output <= 0 || output >= context {
+		return 0, fmt.Errorf("compress_openai token limits must be positive with output below context")
+	}
+	return context - output, nil
 }
 
 func resolveAPIKey(cfg *OpenAIConfig) {
@@ -100,19 +189,13 @@ func applyDefaults(cfg *Config) {
 		cfg.OpenAI.BaseURL = "https://api.openai.com/v1"
 	}
 	if cfg.OpenAI.APIInterface == "" {
-		cfg.OpenAI.APIInterface = "chat_completions"
+		cfg.OpenAI.APIInterface = "responses"
 	}
 	if cfg.OpenAI.Model == "" {
 		cfg.OpenAI.Model = "gpt-4o-mini"
 	}
 	if cfg.OpenAI.TopP == 0 {
 		cfg.OpenAI.TopP = 1
-	}
-	if cfg.OpenAI.MaxContextTokens == 0 {
-		cfg.OpenAI.MaxContextTokens = 32000
-	}
-	if cfg.OpenAI.MaxOutputTokens == 0 {
-		cfg.OpenAI.MaxOutputTokens = 4096
 	}
 	if cfg.OpenAI.TimeoutSeconds == 0 {
 		cfg.OpenAI.TimeoutSeconds = int((120 * time.Second).Seconds())
@@ -133,15 +216,6 @@ func applyDefaults(cfg *Config) {
 	if cfg.Prompts.TemplatesDir == "" {
 		cfg.Prompts.TemplatesDir = "prompts/templates"
 	}
-	if cfg.Agent.CompressAtRatio == 0 {
-		cfg.Agent.CompressAtRatio = 0.75
-	}
-	if cfg.Agent.SummaryInterval == 0 {
-		cfg.Agent.SummaryInterval = 10
-	}
-	if cfg.Agent.AutoSaveInterval == 0 {
-		cfg.Agent.AutoSaveInterval = 5
-	}
 	if cfg.Agent.SessionDir == "" {
 		cfg.Agent.SessionDir = "sessions"
 	}
@@ -160,11 +234,20 @@ func applyDefaults(cfg *Config) {
 	if cfg.Agent.MaxToolResultChars == 0 {
 		cfg.Agent.MaxToolResultChars = 12000
 	}
+	if cfg.Agent.ReconAgents == 0 {
+		cfg.Agent.ReconAgents = 4
+	}
+	if cfg.Agent.AuditAgents == 0 {
+		cfg.Agent.AuditAgents = 4
+	}
+	if cfg.Agent.ForumWaitSeconds == 0 {
+		cfg.Agent.ForumWaitSeconds = 30
+	}
 }
 
 func applyCompressOpenAIDefaults(cfg *Config) {
 	compress := cfg.CompressOpenAI
-	if compress.BaseURL == "" && compress.APIKey == "" && compress.APIKeyEnv == "" && compress.Model == "" {
+	if compress == (OpenAIConfig{}) {
 		cfg.CompressOpenAI = cfg.OpenAI
 		cfg.CompressOpenAI.Stream = false
 		return

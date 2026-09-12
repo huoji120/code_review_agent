@@ -46,7 +46,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	runner := agent.NewWithCompressClient(cfg, prompts, client, compressClient, registry)
+	runner := agent.NewTeam(cfg, prompts, client, compressClient, registry)
+	defer runner.Close()
 	program := tea.NewProgram(tui.New(runner, cfg, *auditDir), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "run tui: %v\n", err)

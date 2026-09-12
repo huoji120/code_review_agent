@@ -13,5 +13,4 @@
 正确示例：
 <tool_call>{"name":"todo_create","arguments":{"title":"审计认证链路：SecureConfiguration.java、JwtAuthenticationFilter.java 检查认证绕过和 JWT 风险","priority":"high"}}</tool_call>
 
-如果审计已经完成，则只输出：
-<tool_call>{"name":"end_audit","arguments":{...}}</tool_call>
+如果本阶段任务已经完成：侦察 Agent 只能调用 audit_plan_done 提交结构化交接；审计 Agent 只能调用 end_audit。结束工具只结束当前 Agent，不影响同伴。

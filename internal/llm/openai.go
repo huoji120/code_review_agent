@@ -134,6 +134,9 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (string, er
 			content.WriteString(delta.Content)
 			return nil
 		})
+		if err != nil && c.useResponsesAPI() {
+			return "", err
+		}
 		return joinAssistantParts(thinking.String(), content.String()), err
 	}
 	if c.cfg.APIKey == "" {
@@ -185,7 +188,8 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (string, er
 }
 
 func (c *OpenAIClient) useResponsesAPI() bool {
-	return strings.EqualFold(strings.TrimSpace(c.cfg.APIInterface), "responses")
+	api := strings.TrimSpace(c.cfg.APIInterface)
+	return api == "" || strings.EqualFold(api, "responses")
 }
 
 func (c *OpenAIClient) endpoint(path string) string {
@@ -211,42 +215,96 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, readErr := io.ReadAll(resp.Body)
+		body, readErr := readResponsesBody(resp.Body)
 		if readErr != nil {
 			return readErr
 		}
 		return fmt.Errorf("openai status %d: %s", resp.StatusCode, string(body))
 	}
+	// Track only emitted part identities, never a second copy of generated text.
+	seen := make(map[responsesPart]bool)
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), responsesMaxBytes)
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, ":") || strings.HasPrefix(line, "event:") {
-			continue
-		}
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
-			return nil
+			return fmt.Errorf("openai responses: stream ended without response.completed")
 		}
 		var chunk responsesStreamEvent
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			return err
+			return fmt.Errorf("openai responses event: %w", err)
 		}
-		delta := Delta{Content: firstNonEmpty(chunk.Delta, chunk.Text), Thinking: firstNonEmpty(chunk.ReasoningText, chunk.ReasoningDelta)}
-		if delta.Content == "" && delta.Thinking == "" {
+		var delta Delta
+		part := responsesPart{Output: chunk.OutputIndex, Index: chunk.ContentIndex}
+		switch chunk.Type {
+		case "response.output_text.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+			var text string
+			if err := json.Unmarshal(chunk.Delta, &text); err != nil {
+				return fmt.Errorf("openai responses delta: %w", err)
+			}
+			if text == "" {
+				continue
+			}
+			switch chunk.Type {
+			case "response.output_text.delta":
+				part.Kind = "output_text"
+				delta.Content = text
+			case "response.reasoning_text.delta":
+				part.Kind = "reasoning_text"
+				delta.Thinking = text
+			case "response.reasoning_summary_text.delta":
+				part.Kind = "summary_text"
+				part.Index = chunk.SummaryIndex
+				delta.Thinking = text
+			}
+			if !seen[part] {
+				if len(seen) >= responsesMaxBytes/64 {
+					return fmt.Errorf("openai responses: too many streamed content parts")
+				}
+				seen[part] = true
+			}
+		case "response.completed":
+			if err := chunk.Response.completed(); err != nil {
+				return err
+			}
+			if err := chunk.Response.eachText(func(part responsesPart, delta Delta) error {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if seen[part] {
+					return nil
+				}
+				return emit(delta)
+			}); err != nil {
+				return err
+			}
+			return ctx.Err()
+		case "response.failed", "response.incomplete", "response.cancelled":
+			return fmt.Errorf("openai responses %s: %s", chunk.Type, chunk.Response.failureDetail())
+		case "error", "response.error":
+			return fmt.Errorf("openai responses error: %s", firstNonEmpty(chunk.Message, chunk.Error.Message, chunk.Code, chunk.Error.Code, "unspecified API error"))
+		default:
+			// Done snapshots and unrelated tool/audio deltas are not answer text.
 			continue
 		}
 		if err := emit(delta); err != nil {
 			return err
 		}
 	}
-	return scanner.Err()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("openai responses: stream ended without response.completed: %w", io.ErrUnexpectedEOF)
 }
 
 func (c *OpenAIClient) responsesChat(ctx context.Context, messages []Message) (string, error) {
@@ -266,7 +324,7 @@ func (c *OpenAIClient) responsesChat(ctx context.Context, messages []Message) (s
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponsesBody(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -277,13 +335,29 @@ func (c *OpenAIClient) responsesChat(ctx context.Context, messages []Message) (s
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return "", err
 	}
-	return joinAssistantParts(parsed.reasoningText(), parsed.outputText()), nil
+	if err := parsed.completed(); err != nil {
+		return "", err
+	}
+	var thinking, content strings.Builder
+	if err := parsed.eachText(func(_ responsesPart, delta Delta) error {
+		thinking.WriteString(delta.Thinking)
+		content.WriteString(delta.Content)
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	return joinAssistantParts(thinking.String(), content.String()), nil
 }
 
 func responsesInput(messages []Message) []responsesInputItem {
 	items := make([]responsesInputItem, 0, len(messages))
 	for _, msg := range messages {
-		items = append(items, responsesInputItem{Role: string(msg.Role), Content: []responsesContentItem{{Type: "input_text", Text: msg.Content}}})
+		role := string(msg.Role)
+		if msg.Role == RoleTool {
+			// Text-protocol tool results are user input, not native function outputs.
+			role = string(RoleUser)
+		}
+		items = append(items, responsesInputItem{Role: role, Content: msg.Content})
 	}
 	return items
 }
@@ -350,8 +424,8 @@ type responsesRequest struct {
 }
 
 type responsesInputItem struct {
-	Role    string                 `json:"role"`
-	Content []responsesContentItem `json:"content"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 type responsesContentItem struct {
@@ -359,48 +433,94 @@ type responsesContentItem struct {
 	Text string `json:"text"`
 }
 
-type responsesResponse struct {
-	Output []struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	} `json:"output"`
-	OutputText string `json:"output_text"`
-	Reasoning  []struct {
-		Text string `json:"text"`
-	} `json:"reasoning"`
+const responsesMaxBytes = 1024 * 1024
+
+func readResponsesBody(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, responsesMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > responsesMaxBytes {
+		return nil, fmt.Errorf("openai responses: response body exceeds %d bytes", responsesMaxBytes)
+	}
+	return data, nil
 }
 
-func (r responsesResponse) outputText() string {
-	if r.OutputText != "" {
-		return r.OutputText
+type responsesAPIError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type responsesResponse struct {
+	Status            string            `json:"status"`
+	Error             responsesAPIError `json:"error"`
+	IncompleteDetails struct {
+		Reason string `json:"reason"`
+	} `json:"incomplete_details"`
+	Output []struct {
+		Type    string                 `json:"type"`
+		Role    string                 `json:"role"`
+		Content []responsesContentItem `json:"content"`
+		Summary []responsesContentItem `json:"summary"`
+	} `json:"output"`
+}
+
+func (r responsesResponse) failureDetail() string {
+	return firstNonEmpty(r.Error.Message, r.Error.Code, r.IncompleteDetails.Reason, r.Status, "missing response status")
+}
+
+func (r responsesResponse) completed() error {
+	if r.Status != "completed" || r.Error.Message != "" || r.Error.Code != "" {
+		return fmt.Errorf("openai responses did not complete: %s", r.failureDetail())
 	}
-	var b strings.Builder
-	for _, item := range r.Output {
-		for _, content := range item.Content {
+	return nil
+}
+
+type responsesPart struct {
+	Output int
+	Index  int
+	Kind   string
+}
+
+func (r responsesResponse) eachText(emit func(responsesPart, Delta) error) error {
+	for outputIndex, item := range r.Output {
+		for contentIndex, content := range item.Content {
+			var delta Delta
+			switch {
+			case item.Type == "message" && item.Role == "assistant" && content.Type == "output_text":
+				delta.Content = content.Text
+			case item.Type == "reasoning" && content.Type == "reasoning_text":
+				delta.Thinking = content.Text
+			default:
+				continue
+			}
 			if content.Text != "" {
-				b.WriteString(content.Text)
+				if err := emit(responsesPart{Output: outputIndex, Index: contentIndex, Kind: content.Type}, delta); err != nil {
+					return err
+				}
+			}
+		}
+		if item.Type == "reasoning" {
+			for summaryIndex, summary := range item.Summary {
+				if summary.Type == "summary_text" && summary.Text != "" {
+					if err := emit(responsesPart{Output: outputIndex, Index: summaryIndex, Kind: summary.Type}, Delta{Thinking: summary.Text}); err != nil {
+						return err
+					}
+				}
 			}
 		}
 	}
-	return b.String()
-}
-
-func (r responsesResponse) reasoningText() string {
-	var b strings.Builder
-	for _, item := range r.Reasoning {
-		if item.Text != "" {
-			b.WriteString(item.Text)
-		}
-	}
-	return b.String()
+	return nil
 }
 
 type responsesStreamEvent struct {
-	Type           string `json:"type"`
-	Delta          string `json:"delta"`
-	Text           string `json:"text"`
-	ReasoningText  string `json:"reasoning_text"`
-	ReasoningDelta string `json:"reasoning_delta"`
+	Type         string            `json:"type"`
+	Delta        json.RawMessage   `json:"delta"`
+	OutputIndex  int               `json:"output_index"`
+	ContentIndex int               `json:"content_index"`
+	SummaryIndex int               `json:"summary_index"`
+	Response     responsesResponse `json:"response"`
+	Code         string            `json:"code"`
+	Message      string            `json:"message"`
+	Error        responsesAPIError `json:"error"`
 }

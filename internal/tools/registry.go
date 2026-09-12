@@ -1,12 +1,14 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type Registry struct {
@@ -22,6 +24,13 @@ type Registry struct {
 	flows              []FlowReview
 	audit              AuditState
 	nextTodoID         int
+	bufferMu           sync.Mutex
+	buffer             resultBuffer
+}
+
+type resultBuffer struct {
+	id      string
+	content string
 }
 
 type InventoryEntry struct {
@@ -118,14 +127,25 @@ func NewRegistry(workspace string, maxToolResultChars int) (*Registry, error) {
 	if err != nil {
 		return nil, err
 	}
+	if maxToolResultChars <= 0 {
+		maxToolResultChars = 12000
+	}
+	if maxToolResultChars < 1024 {
+		maxToolResultChars = 1024
+	}
+	if maxToolResultChars > 65536 {
+		maxToolResultChars = 65536
+	}
 	r := &Registry{workspace: abs, maxToolResultChars: maxToolResultChars, nextTodoID: 1, interesting: loadInterestingPathsConfig()}
 	r.refreshFileInventory()
 	return r, nil
 }
-
 func (r *Registry) SetWorkspace(workspace string) error {
 	abs, err := cleanWorkspace(workspace)
 	if err != nil {
+		return err
+	}
+	if err := r.Close(); err != nil {
 		return err
 	}
 	r.workspace = abs
@@ -142,10 +162,7 @@ func (r *Registry) SetWorkspace(workspace string) error {
 	return nil
 }
 
-func (r *Registry) Workspace() string {
-	return r.workspace
-}
-
+func (r *Registry) Workspace() string { return r.workspace }
 func cleanWorkspace(workspace string) (string, error) {
 	if workspace == "" {
 		workspace = "."
@@ -165,11 +182,13 @@ func cleanWorkspace(workspace string) (string, error) {
 }
 
 func (r *Registry) Call(name string, raw json.RawMessage) string {
-	out, _ := r.CallWithFullResult(name, raw)
+	out, _ := r.CallWithFullResult(context.Background(), name, raw)
 	return out
 }
-
-func (r *Registry) CallWithFullResult(name string, raw json.RawMessage) (string, string) {
+func (r *Registry) CallWithFullResult(ctx context.Context, name string, raw json.RawMessage) (string, string) {
+	if name != "read_tool_buffer" {
+		r.ClearBuffer()
+	}
 	var res Result
 	switch name {
 	case "list_files":
@@ -200,6 +219,9 @@ func (r *Registry) CallWithFullResult(name string, raw json.RawMessage) (string,
 		res = r.reportFinding(raw)
 	case "end_audit":
 		res = r.endAudit(raw)
+	case "read_tool_buffer":
+		page := r.readToolBuffer(raw)
+		return page, page
 	default:
 		res = Result{OK: false, Error: "unknown tool: " + name}
 	}
@@ -208,17 +230,13 @@ func (r *Registry) CallWithFullResult(name string, raw json.RawMessage) (string,
 		out := fmt.Sprintf(`{"ok":false,"error":%q}`, err.Error())
 		return out, out
 	}
-	out := string(data)
-	full := out
-	if r.maxToolResultChars > 0 && len(out) > r.maxToolResultChars {
-		out = out[:r.maxToolResultChars] + "\n...truncated..."
-	}
-	return out, full
+	full := string(data)
+	return r.BoundResult(name, full), full
 }
 
 func IsKnownTool(name string) bool {
 	switch name {
-	case "list_files", "read_file", "search_content", "search_context", "git_inspect", "todo_create", "todo_update", "file_review_update", "variable_review_update", "flow_review_update", "flow_review_delete", "review_state", "project_note_update", "report_finding", "end_audit", "load_skill", "verify_finding", "audit_plan_done":
+	case "list_files", "read_file", "search_content", "search_context", "git_inspect", "todo_create", "todo_update", "file_review_update", "variable_review_update", "flow_review_update", "flow_review_delete", "review_state", "project_note_update", "report_finding", "end_audit", "read_tool_buffer", "load_skill", "verify_finding", "audit_plan_done":
 		return true
 	default:
 		return false
@@ -299,6 +317,7 @@ Windows 路径写入 JSON 时，如果使用反斜杠，必须写成双反斜杠
 
 - list_files：列出文件。参数：root、pattern、max_depth、include_hidden、limit。pattern 默认按大小写不敏感匹配。系统启动时已经预载了初始文件清单，通常只在需要刷新视图时再调用。
 - read_file：读取文件，支持偏移行读取。参数：path、offset、limit。path 优先传 review_state/list_files/search_content 返回的工作区相对路径，不要自己拼绝对路径；如果误传包含工作区名的绝对路径或唯一文件名，工具会尽量恢复到真实相对路径。返回 path、offset、limit、total_lines 和 lines，total_lines 表示文件总行数。
+- read_tool_buffer：读取上一次超长工具结果的内存 buffer。参数：buffer_id、offset、limit；offset 使用 UTF-8 字节偏移，返回 content、next_offset、eof。仅连续调用本工具时保留 buffer；任何其他工具调用前立即清空旧 buffer，不落盘、不保留历史。请先读完需要的页再调用其他工具。
 - search_content：搜索文件内容。参数：query、mode、root、include、limit、case_insensitive、case_sensitive。mode 支持 literal、regex、fuzzy。literal 是默认模式，query 按普通字符串包含搜索，不解析 .*、|、\b、[\s\S]、分组等正则语法；使用任何正则语法时必须显式传 mode:"regex"。regex 支持跨行匹配。默认按大小写不敏感搜索；如需区分大小写再显式传 case_sensitive:true。include 支持文件名模式和 globstar，例如 *.java、**/*Controller.java、**/*.php；也支持相对路径模式，例如 src/main/java/*.java、src/main/*Controller.java，并默认按大小写不敏感匹配。返回 ok:true 且 data:null 通常表示搜索执行成功但无匹配结果，不代表工具失败。工具名必须优先使用 search_content；如果误写成 search_context，系统会兼容转为 search_content。
 - git_inspect：只读 Git 检查工具。只有“当前 Git 状态”显示 Git 可用时才调用；不可用或非 Git 仓库时调用会失败。参数：action、base、head、ref、commit、path、line_start、line_end、limit、context、staged、unstaged。action 支持 status、changed_files、diff、log、show、blame。用于增量审计、查看改动文件、diff、提交历史、特定版本文件和行级 blame。禁止用于 commit/push/pull/checkout/reset/merge/rebase 等写操作；本工具不会执行这些操作。
 - todo_create：创建详细 todo。参数：title、priority。title 使用中文，必须包含具体文件/目录/模块/入口函数/变量/审计点，禁止空泛描述。
@@ -309,7 +328,7 @@ Windows 路径写入 JSON 时，如果使用反斜杠，必须写成双反斜杠
 - flow_review_delete：删除已经闭环或不再需要展示的跨文件 flow。参数：name。flow 是临时工作队列，不要长期攒着。
 - review_state：查看当前 todo、项目笔记、文件排查、变量排查、跨文件 flow 和漏洞状态。参数：limit。
 - project_note_update：更新项目级自由文本笔记。参数：note。note 应该像人工审计员工作笔记一样尽量详细，模型自行组织结构；规划阶段必须积极、频繁维护，重点记录项目架构、运行行为、登录认证机制、鉴权机制、重要攻击面、数据/状态流、关键文件角色、已知结论和待确认问题。每次读到新的架构/认证/鉴权/入口信息后都应更新，不能只写摘要。
-- verify_finding：启动一个不会压缩上下文的漏洞验证子 agent，复核候选漏洞是否真实成立。子 agent 可以继续调用工具、复读多文件利用链，并最终返回中文验证结论。参数：severity、title、path、line、evidence、impact、recommendation、cwe。
+- verify_finding：启动独立漏洞验证子 agent，使用独立 buffer 和上下文预算，复核候选漏洞是否真实成立。子 agent 可以继续调用工具、通过论坛交流、复读多文件利用链，并最终返回中文验证结论。参数：severity、title、path、line、evidence、impact、recommendation、cwe。
 - report_finding：只提交高置信度、证据清晰、利用链清楚、能造成实际危害的严重安全漏洞。调用前必须先用 variable_review_update 记录关键变量排查，并用 flow_review_update 记录跨文件入口、调用链、sink 和证据。参数：severity、title、path、line、evidence、impact、recommendation、cwe。severity 必须按系统提示词的严重性分级规则选择，不要随便报 high/critical；除 path 和 cwe 外尽量使用中文。
 - end_audit：结束审计。参数：summary、next_steps。必须使用中文。调用前应先调用 review_state 检查文件排查状态。理想情况下文件都已 reviewed/skipped 再结束；不要因为只发现一个漏洞、剩余文件很多、避免盲扫、某个方向无法闭环或主观觉得“没有审计价值”就提前结束，必须继续深挖同一入口、同一模块、相邻文件和同类路径，尽可能一次找全问题。只有关键入口、高风险文件类型、高价值链路、同类代表文件和相关搜索模式都已经尽可能覆盖后，才允许在收到第一次提醒后第二次再次调用 end_audit。summary 必须总结 todo、文件覆盖情况、剩余 unseen/reviewing 文件类别、变量/flow、漏洞结论和继续审计剩余项为何不会增加有效安全覆盖。
 
