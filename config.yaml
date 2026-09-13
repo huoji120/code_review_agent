@@ -1,0 +1,41 @@
+workspace: .
+
+openai:
+  api_interface: responses
+  base_url: https://api.deepseek.com/v1
+  api_key: sk-xxxxxxx
+  model: deepseek-v4-flash
+  temperature: 0.8
+  top_p: 1
+  max_context_tokens: 1048576
+  max_output_tokens: 393216
+  timeout_seconds: 10
+  stream: true
+
+prompts:
+  system: prompts/system.md
+  compress: prompts/compress.md
+  skills_dir: skills
+  templates_dir: prompts/templates
+
+agent:
+  recon_agents: 8
+  audit_agents: 64
+  forum_wait_seconds: 60
+  # 无限模式：禁止模型结束审计；时间或 token 任一耗尽即停止。
+  # 时间合计为 0、token 为 0 分别表示不限；两项均为 0 则无限。
+  infinite_mode: false
+  budget_hours: 8
+  budget_minutes: 0
+  budget_tokens: 0
+  max_turns: 0
+  session_dir: sessions
+  log_session: false
+  log_session_dir: log_sessions
+  retry_attempts: 3
+  compress_at_ratio: 0.70
+  compress_buffer_tokens: 393216
+  auto_plan: true
+  max_tool_result_chars: 12000
+  moderator_enabled: true
+  moderator_interval_seconds: 60
