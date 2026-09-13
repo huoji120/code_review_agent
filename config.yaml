@@ -24,7 +24,7 @@ agent:
   forum_wait_seconds: 60
   # 无限模式：禁止模型结束审计；时间或 token 任一耗尽即停止。
   # 时间合计为 0、token 为 0 分别表示不限；两项均为 0 则无限。
-  infinite_mode: false
+  infinite_mode: true
   budget_hours: 8
   budget_minutes: 0
   budget_tokens: 0
