@@ -43,7 +43,13 @@ func (a *Agent) startNaming(ctx context.Context, emit func(Event)) func() {
 			var result struct {
 				Name string `json:"name"`
 			}
-			err = json.Unmarshal([]byte(removeThinkBlocks(text)), &result)
+			candidate := strings.TrimSpace(removeThinkBlocks(text))
+			if start := strings.Index(candidate, "{"); start >= 0 {
+				if end := strings.LastIndex(candidate, "}"); end >= start {
+					candidate = candidate[start : end+1]
+				}
+			}
+			err = json.Unmarshal([]byte(candidate), &result)
 			if err == nil && playfulName(result.Name) {
 				err = board.RegisterName(id, result.Name)
 				if err == nil {

@@ -279,3 +279,34 @@ func TestNameBackfillHonorsRetentionBudget(t *testing.T) {
 		t.Fatal("name backfill exceeded board retention budget")
 	}
 }
+
+func TestAllMentionReachesNonparticipantsWithoutSelfNotification(t *testing.T) {
+	for _, mention := range []string{"@all", "@全体成员", "@全体"} {
+		t.Run(mention, func(t *testing.T) {
+			b := testBoard()
+			root, _ := b.Post("a", "audit", "*", 0, "review", "original")
+			first, _ := b.Post("b", "audit", "a", root.ID, "", "ordinary reply")
+			if _, cursor, text := notice(t, b, "c", root.ID, 1024); text != "" || cursor != first.ID {
+				t.Fatal("ordinary reply notified nonparticipant")
+			}
+			broadcast, _ := b.Post("b", "audit", "a", first.ID, "", mention+" "+strings.Repeat("新证据<>", 300))
+			for _, id := range []string{"a", "c"} {
+				p, cursor, _ := notice(t, b, id, first.ID, 1024)
+				if len(p.Entries) != 1 || p.Entries[0].LatestMessageID != broadcast.ID || p.Entries[0].ThreadID != root.ID || cursor != broadcast.ID {
+					t.Fatalf("mention did not reach %s: %+v", id, p)
+				}
+				if _, _, text := notice(t, b, id, cursor, 1024); text != "" {
+					t.Fatal("mention was delivered twice")
+				}
+			}
+			if _, cursor, text := notice(t, b, "b", first.ID, 1024); text != "" || cursor != broadcast.ID {
+				t.Fatal("mention notified its author")
+			}
+			// Receiving a mention does not permanently subscribe the outsider.
+			plain, _ := b.Post("a", "audit", "*", first.ID, "", "ordinary follow-up")
+			if _, cursor, text := notice(t, b, "c", broadcast.ID, 1024); text != "" || cursor != plain.ID {
+				t.Fatal("mention silently subscribed nonparticipant")
+			}
+		})
+	}
+}

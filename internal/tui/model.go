@@ -24,31 +24,31 @@ var terminalWidthOnce sync.Once
 
 // Model retains worker status and recent operations, never model streams.
 type Model struct {
-	runner                                                 *agent.Team
-	input                                                  textinput.Model
-	width, height                                          int
-	autoDir, sessionDir, sessionPath, workspace, lastQuery string
-	workspaceReady, busy, stopping, quitting, saving       bool
-	cancel                                                 context.CancelFunc
-	session                                                int
-	mailbox                                                *eventMailbox
-	phase                                                  string
-	workers                                                []agent.WorkerStatus
-	forumPage                                              forum.PostPage
-	forumSearch                                            string
-	forumDirty                                             bool
-	forumCache                                             *forumRenderCache
-	forumRevision                                          uint64
-	threadID                                               int64
-	selectedPost                                           int64
-	expandedPosts                                          map[int64]bool
-	snapshot                                               tools.Snapshot
-	events                                                 []operationEvent
-	modal                                                  *modalState
-	focus                                                  int
-	scroll                                                 [2]int
-	follow                                                 [2]bool
-	finalSavePending                                       bool
+	runner                                                        *agent.Team
+	input                                                         textinput.Model
+	width, height                                                 int
+	autoDir, sessionDir, sessionPath, workspace, lastQuery        string
+	workspaceReady, busy, stopping, quitting, saving, escapeArmed bool
+	cancel                                                        context.CancelFunc
+	session                                                       int
+	mailbox                                                       *eventMailbox
+	phase                                                         string
+	workers                                                       []agent.WorkerStatus
+	forumPage                                                     forum.PostPage
+	forumSearch                                                   string
+	forumDirty                                                    bool
+	forumCache                                                    *forumRenderCache
+	forumRevision                                                 uint64
+	threadID                                                      int64
+	selectedPost                                                  int64
+	expandedPosts                                                 map[int64]bool
+	snapshot                                                      tools.Snapshot
+	events                                                        []operationEvent
+	modal                                                         *modalState
+	focus                                                         int
+	scroll                                                        [2]int
+	follow                                                        [2]bool
+	finalSavePending                                              bool
 }
 
 type operationEvent struct {
@@ -89,9 +89,9 @@ func (b *eventMailbox) post(e agent.Event) {
 		b.mu.Unlock()
 		return
 	}
-	if e.Kind == "state" {
+	if e.Kind == "state" || e.Kind == "model_progress" {
 		for i := len(b.queue) - 1; i >= 0; i-- {
-			if b.queue[i].Kind == "state" {
+			if b.queue[i].Kind == e.Kind {
 				copy(b.queue[i:], b.queue[i+1:])
 				b.queue[len(b.queue)-1] = agent.Event{}
 				b.queue = b.queue[:len(b.queue)-1]
@@ -135,7 +135,7 @@ func waitAgent(session int, b *eventMailbox) tea.Cmd {
 }
 func operationalEvent(kind string) bool {
 	switch kind {
-	case "state", "worker", "name", "forum", "tool", "waiting", "info", "error", "verify_progress", "verify_done":
+	case "state", "model_progress", "worker", "name", "forum", "tool", "waiting", "info", "error", "verify_progress", "verify_done":
 		return true
 	}
 	return false
@@ -298,6 +298,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 func (m *Model) handleKey(key tea.KeyMsg) (tea.Cmd, bool) {
+	if key.String() != "esc" && key.String() != "ctrl+[" {
+		m.escapeArmed = false
+	}
 	switch key.String() {
 	case "ctrl+c":
 		if m.busy {
@@ -312,6 +315,16 @@ func (m *Model) handleKey(key tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		return tea.Quit, true
 	case "esc", "ctrl+[":
+		if !m.busy || m.stopping {
+			m.escapeArmed = false
+			return nil, true
+		}
+		if !m.escapeArmed {
+			m.escapeArmed = true
+			m.addEvent("再按一次 Esc 暂停审计；其他按键取消确认。")
+			return nil, true
+		}
+		m.escapeArmed = false
 		m.stop()
 		return nil, true
 	case "tab":
@@ -428,6 +441,11 @@ func (m *Model) applyEvent(e agent.Event) {
 	}
 	if e.Workers != nil {
 		m.workers = e.Workers
+		if m.modal != nil && m.modal.agents {
+			m.modal.lines = m.agentDetailLines()
+			m.modal.wrapWidth = 0
+			m.resizeModal()
+		}
 	}
 	switch e.Kind {
 	case "state":
@@ -465,4 +483,3 @@ func (m *Model) addAgentEvent(id, text string) {
 	}
 	m.events = append(m.events, entry)
 }
-

@@ -3,15 +3,16 @@ package llm
 import (
 	"bufio"
 	"bytes"
+	"code-review-agent/internal/config"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
-
-	"code-review-agent/internal/config"
 )
 
 type Role string
@@ -24,18 +25,75 @@ const (
 )
 
 type Message struct {
-	Role    Role   `json:"role"`
-	Content string `json:"content"`
+	Role      Role   `json:"role,omitempty"`
+	Content   string `json:"content,omitempty"`
+	Type      string `json:"type,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+	ID        string `json:"id,omitempty"`
 }
+
+type ToolDefinition struct {
+	Type        string          `json:"type"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+	Strict      bool            `json:"strict"`
+}
+
+type FunctionCall struct {
+	ID        string `json:"id,omitempty"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type ToolResponse struct {
+	Content  string
+	Thinking string
+	Calls    []FunctionCall
+}
+
+type ToolClient interface {
+	ChatTools(context.Context, []Message, []ToolDefinition, func(Delta) error) (ToolResponse, error)
+}
+
+var ErrToolProtocol = errors.New("openai tool protocol error")
+
+type ToolProtocolError struct {
+	Kind string
+	Err  error
+}
+
+func (e *ToolProtocolError) Error() string {
+	if e.Err == nil {
+		return "openai tool protocol: " + e.Kind
+	}
+	return "openai tool protocol " + e.Kind + ": " + e.Err.Error()
+}
+func (e *ToolProtocolError) Unwrap() error        { return e.Err }
+func (e *ToolProtocolError) Is(target error) bool { return target == ErrToolProtocol }
 
 type Client interface {
 	Chat(ctx context.Context, messages []Message) (string, error)
 	ChatStream(ctx context.Context, messages []Message, emit func(Delta) error) error
 }
 
+// GenerationProgress describes output from the current native request, not context
+// input. ToolTokens is available only for estimates; providers do not report it.
+type GenerationProgress struct {
+	OutputTokens    int64  `json:"output_tokens"`
+	ReasoningTokens int64  `json:"reasoning_tokens"`
+	ToolTokens      int64  `json:"tool_tokens"`
+	Estimated       bool   `json:"estimated"`
+	ReceivedAt      string `json:"received_at,omitempty"`
+}
+
 type Delta struct {
 	Content  string
 	Thinking string
+	Progress *GenerationProgress
 }
 
 type OpenAIClient struct {
@@ -71,13 +129,13 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, emit 
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 
-	resp, err := c.httpClient.Do(req)
+	resp, ctx, err := c.doStream(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, readErr := io.ReadAll(resp.Body)
+		body, readErr := readResponsesBody(resp.Body)
 		if readErr != nil {
 			return readErr
 		}
@@ -88,7 +146,7 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, emit 
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return context.Cause(ctx)
 		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, ":") {
@@ -99,7 +157,7 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, emit 
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
-			return nil
+			return context.Cause(ctx)
 		}
 		var chunk streamResponse
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
@@ -115,7 +173,13 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, emit 
 			}
 		}
 	}
-	return scanner.Err()
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("openai chat completions: stream ended without [DONE]: %w", io.ErrUnexpectedEOF)
 }
 
 func NewOpenAIClient(cfg config.OpenAIConfig) *OpenAIClient {
@@ -123,6 +187,109 @@ func NewOpenAIClient(cfg config.OpenAIConfig) *OpenAIClient {
 		cfg:        cfg,
 		httpClient: &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second},
 	}
+}
+
+// Streaming requests share the transport, but not the client's whole-request
+// deadline. The watchdog bounds header wait, then each period without body bytes.
+func (c *OpenAIClient) doStream(req *http.Request) (*http.Response, context.Context, error) {
+	ctx, cancel := context.WithCancelCause(req.Context())
+	idle := &streamIdle{ctx: ctx, cancel: cancel, timeout: c.httpClient.Timeout}
+	if idle.timeout > 0 {
+		idle.deadline = time.Now().Add(idle.timeout)
+		idle.timer = time.AfterFunc(idle.timeout, idle.expire)
+	}
+	client := *c.httpClient
+	client.Timeout = 0
+	resp, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
+		idle.close()
+		return nil, ctx, err
+	}
+	idle.activity()
+	resp.Body = &streamBody{ReadCloser: resp.Body, idle: idle}
+	return resp, ctx, nil
+}
+
+type streamTimeoutError struct {
+	timeout time.Duration
+}
+
+func (e *streamTimeoutError) Error() string {
+	return fmt.Sprintf("openai stream: no network progress for %s", e.timeout)
+}
+
+func (e *streamTimeoutError) Timeout() bool { return true }
+
+func (e *streamTimeoutError) Temporary() bool { return true }
+
+func (e *streamTimeoutError) Unwrap() error { return context.DeadlineExceeded }
+
+type streamIdle struct {
+	mu       sync.Mutex
+	ctx      context.Context
+	cancel   context.CancelCauseFunc
+	timeout  time.Duration
+	deadline time.Time
+	timer    *time.Timer
+	closed   bool
+}
+
+func (s *streamIdle) expire() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.ctx.Err() != nil {
+		return
+	}
+	// Reset can race a callback already scheduled by the old deadline. Only
+	// expire after the latest observed activity, never the stale timer firing.
+	if remaining := time.Until(s.deadline); remaining > 0 {
+		s.timer.Reset(remaining)
+		return
+	}
+	s.cancel(&streamTimeoutError{timeout: s.timeout})
+}
+
+func (s *streamIdle) activity() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed && s.timer != nil && s.ctx.Err() == nil {
+		s.deadline = time.Now().Add(s.timeout)
+		s.timer.Reset(s.timeout)
+	}
+}
+
+func (s *streamIdle) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	if s.timer != nil {
+		s.timer.Stop()
+	}
+	s.cancel(nil)
+}
+
+type streamBody struct {
+	io.ReadCloser
+	idle *streamIdle
+}
+
+func (b *streamBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if cause := context.Cause(b.idle.ctx); cause != nil {
+		return 0, cause
+	}
+	if n > 0 {
+		b.idle.activity()
+	}
+	return n, err
+}
+
+func (b *streamBody) Close() error {
+	b.idle.close()
+	return b.ReadCloser.Close()
 }
 
 func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (string, error) {
@@ -134,7 +301,7 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (string, er
 			content.WriteString(delta.Content)
 			return nil
 		})
-		if err != nil && c.useResponsesAPI() {
+		if err != nil {
 			return "", err
 		}
 		return joinAssistantParts(thinking.String(), content.String()), err
@@ -157,13 +324,13 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (string, er
 		return "", err
 	}
 	url := c.endpoint("/chat/completions")
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
-
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", err
@@ -185,6 +352,18 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (string, er
 	}
 	msg := parsed.Choices[0].Message
 	return joinAssistantParts(firstNonEmpty(msg.ReasoningContent, msg.Reasoning, msg.ReasoningText), msg.Content), nil
+}
+
+// ChatTools uses the provider's native function-call protocol. Tool calls are
+// collected but never inferred from text/reasoning channels.
+func (c *OpenAIClient) ChatTools(ctx context.Context, messages []Message, tools []ToolDefinition, emit func(Delta) error) (ToolResponse, error) {
+	if c.cfg.APIKey == "" {
+		return ToolResponse{}, fmt.Errorf("missing API key")
+	}
+	if c.useResponsesAPI() {
+		return c.responsesTools(ctx, messages, tools, emit)
+	}
+	return c.chatCompletionsTools(ctx, messages, tools, emit)
 }
 
 func (c *OpenAIClient) useResponsesAPI() bool {
@@ -209,7 +388,7 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
-	resp, err := c.httpClient.Do(req)
+	resp, ctx, err := c.doStream(req)
 	if err != nil {
 		return err
 	}
@@ -227,7 +406,7 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 	scanner.Buffer(make([]byte, 0, 64*1024), responsesMaxBytes)
 	for scanner.Scan() {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return context.Cause(ctx)
 		}
 		line := strings.TrimSpace(scanner.Text())
 		if !strings.HasPrefix(line, "data:") {
@@ -235,7 +414,7 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
-			return fmt.Errorf("openai responses: stream ended without response.completed")
+			return fmt.Errorf("openai responses: stream ended without response.completed: %w", io.ErrUnexpectedEOF)
 		}
 		var chunk responsesStreamEvent
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
@@ -276,7 +455,7 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 			}
 			if err := chunk.Response.eachText(func(part responsesPart, delta Delta) error {
 				if ctx.Err() != nil {
-					return ctx.Err()
+					return context.Cause(ctx)
 				}
 				if seen[part] {
 					return nil
@@ -285,7 +464,7 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 			}); err != nil {
 				return err
 			}
-			return ctx.Err()
+			return context.Cause(ctx)
 		case "response.failed", "response.incomplete", "response.cancelled":
 			return fmt.Errorf("openai responses %s: %s", chunk.Type, chunk.Response.failureDetail())
 		case "error", "response.error":
@@ -299,7 +478,7 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 		}
 	}
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return context.Cause(ctx)
 	}
 	if err := scanner.Err(); err != nil {
 		return err
@@ -394,24 +573,39 @@ type chatRequest struct {
 
 type chatResponse struct {
 	Choices []struct {
-		Message struct {
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
-			Reasoning        string `json:"reasoning"`
-			ReasoningText    string `json:"reasoning_text"`
-		} `json:"message"`
+		Message      chatModelMessage `json:"message"`
+		FinishReason string           `json:"finish_reason"`
 	} `json:"choices"`
+	Error responsesAPIError `json:"error"`
+	Usage *generationUsage  `json:"usage"`
+}
+
+type chatModelMessage struct {
+	Content          string             `json:"content"`
+	ReasoningContent string             `json:"reasoning_content"`
+	Reasoning        string             `json:"reasoning"`
+	ReasoningText    string             `json:"reasoning_text"`
+	ToolCalls        []chatFunctionCall `json:"tool_calls"`
+}
+
+type chatFunctionCall struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 type streamResponse struct {
 	Choices []struct {
-		Delta struct {
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
-			Reasoning        string `json:"reasoning"`
-			ReasoningText    string `json:"reasoning_text"`
-		} `json:"delta"`
+		Index        int              `json:"index"`
+		Delta        chatModelMessage `json:"delta"`
+		FinishReason string           `json:"finish_reason"`
 	} `json:"choices"`
+	Error responsesAPIError `json:"error"`
+	Usage *generationUsage  `json:"usage"`
 }
 
 type responsesRequest struct {
@@ -451,18 +645,26 @@ type responsesAPIError struct {
 	Message string `json:"message"`
 }
 
+type responsesOutputItem struct {
+	Type      string                 `json:"type"`
+	Role      string                 `json:"role"`
+	ID        string                 `json:"id"`
+	CallID    string                 `json:"call_id"`
+	Name      string                 `json:"name"`
+	Arguments string                 `json:"arguments"`
+	Status    string                 `json:"status"`
+	Content   []responsesContentItem `json:"content"`
+	Summary   []responsesContentItem `json:"summary"`
+}
+
 type responsesResponse struct {
 	Status            string            `json:"status"`
 	Error             responsesAPIError `json:"error"`
 	IncompleteDetails struct {
 		Reason string `json:"reason"`
 	} `json:"incomplete_details"`
-	Output []struct {
-		Type    string                 `json:"type"`
-		Role    string                 `json:"role"`
-		Content []responsesContentItem `json:"content"`
-		Summary []responsesContentItem `json:"summary"`
-	} `json:"output"`
+	Output []responsesOutputItem `json:"output"`
+	Usage  *generationUsage      `json:"usage"`
 }
 
 func (r responsesResponse) failureDetail() string {
@@ -494,7 +696,7 @@ func (r responsesResponse) eachText(emit func(responsesPart, Delta) error) error
 			default:
 				continue
 			}
-			if content.Text != "" {
+			if delta.Content != "" || delta.Thinking != "" {
 				if err := emit(responsesPart{Output: outputIndex, Index: contentIndex, Kind: content.Type}, delta); err != nil {
 					return err
 				}
@@ -514,13 +716,17 @@ func (r responsesResponse) eachText(emit func(responsesPart, Delta) error) error
 }
 
 type responsesStreamEvent struct {
-	Type         string            `json:"type"`
-	Delta        json.RawMessage   `json:"delta"`
-	OutputIndex  int               `json:"output_index"`
-	ContentIndex int               `json:"content_index"`
-	SummaryIndex int               `json:"summary_index"`
-	Response     responsesResponse `json:"response"`
-	Code         string            `json:"code"`
-	Message      string            `json:"message"`
-	Error        responsesAPIError `json:"error"`
+	Type         string              `json:"type"`
+	Delta        json.RawMessage     `json:"delta"`
+	OutputIndex  int                 `json:"output_index"`
+	ContentIndex int                 `json:"content_index"`
+	SummaryIndex int                 `json:"summary_index"`
+	Response     responsesResponse   `json:"response"`
+	Code         string              `json:"code"`
+	Message      string              `json:"message"`
+	Error        responsesAPIError   `json:"error"`
+	Item         responsesOutputItem `json:"item"`
+	ItemID       string              `json:"item_id"`
+	Arguments    string              `json:"arguments"`
+	Text         string              `json:"text"`
 }

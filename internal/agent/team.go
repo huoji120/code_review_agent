@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -17,41 +18,63 @@ import (
 )
 
 type WorkerStatus struct {
-	ID       string `json:"id"`
-	Name     string `json:"name,omitempty"`
-	Phase    string `json:"phase"`
-	Status   string `json:"status"`
-	Activity string `json:"activity"`
-	Turn     int    `json:"turn"`
+	ID                string                  `json:"id"`
+	Name              string                  `json:"name,omitempty"`
+	Phase             string                  `json:"phase"`
+	Status            string                  `json:"status"`
+	Activity          string                  `json:"activity"`
+	Turn              int                     `json:"turn"`
+	LastModelActivity string                  `json:"last_model_activity,omitempty"`
+	LastToolActivity  string                  `json:"last_tool_activity,omitempty"`
+	Generation        *llm.GenerationProgress `json:"generation,omitempty"`
+	LastTool          string                  `json:"last_tool,omitempty"`
+	OutputExcerpt     string                  `json:"output_excerpt,omitempty"`
+	OutputPartial     bool                    `json:"output_partial,omitempty"`
 }
 
 type teamWorker struct {
-	agent *Agent
-	saved workerSession
+	agent          *Agent
+	saved          workerSession
+	wake           chan struct{}
+	active         bool
+	activityCancel context.CancelFunc
 }
 
 // Workers own their models' histories and registries. Readers only see immutable
 // checkpoints; no UI or sibling ever reads a running worker's mutable state.
 type Team struct {
-	mu             sync.Mutex
-	emitMu         sync.Mutex
-	saveMu         sync.Mutex
-	cfg            config.Config
-	prompts        prompt.Prompts
-	client         llm.Client
-	compressClient llm.Client
-	nameClient     llm.Client
-	registry       *tools.Registry
-	board          *forum.Board
-	workers        []*teamWorker
-	phase          string
-	input          string
-	handoff        string
-	snapshot       tools.Snapshot
-	running        bool
-	cancel         context.CancelFunc
-	done           chan struct{}
-	emitter        func(Event)
+	mu                 sync.Mutex
+	emitMu             sync.Mutex
+	saveMu             sync.Mutex
+	cfg                config.Config
+	prompts            prompt.Prompts
+	client             llm.Client
+	compressClient     llm.Client
+	nameClient         llm.Client
+	registry           *tools.Registry
+	board              *forum.Board
+	workers            []*teamWorker
+	moderator          *teamWorker
+	moderatorWake      chan struct{}
+	moderatorReviews   chan moderatorReview
+	moderatorTicks     <-chan time.Time
+	revocations        []FindingRevocation
+	pendingAssignments map[string][]string
+	workerCancels      map[string]map[string]context.CancelFunc
+	phase              string
+	input              string
+	handoff            string
+	snapshot           tools.Snapshot
+	running            bool
+	cancel             context.CancelFunc
+	done               chan struct{}
+	emitter            func(Event)
+	ircMessages        []IRCMessage
+	ircMu              sync.Mutex
+	ircPublishing      int
+	ircNextID          int64
+	ircChanged         chan struct{}
+	stageOpen          bool
 }
 
 func NewTeam(cfg config.Config, prompts prompt.Prompts, client, compressClient llm.Client, registry *tools.Registry) *Team {
@@ -77,19 +100,44 @@ func (t *Team) resetBoard() {
 	t.board = forum.New(time.Duration(t.cfg.Agent.ForumWaitSeconds) * time.Second)
 	t.board.Register("user", "user")
 	t.board.Register("coordinator", "system")
+	if t.cfg.Agent.ModeratorIsEnabled() {
+		t.board.Register(phaseModerator, phaseModerator)
+		_ = t.board.RegisterName(phaseModerator, "论坛管理员")
+	}
 	for _, stage := range []struct {
 		name  string
 		count int
 	}{{phaseRecon, t.cfg.Agent.ReconAgents}, {phaseAudit, t.cfg.Agent.AuditAgents}} {
+		ids := make([]string, 0, stage.count)
 		for i := 1; i <= stage.count; i++ {
 			id := fmt.Sprintf("%s-%d", stage.name, i)
 			t.board.Register(id, stage.name)
 			t.board.SetStatus(id, "pending")
+			ids = append(ids, id)
 		}
+		t.board.SetConsensusMembers(stage.name, ids)
 	}
 	t.board.SetOnPost(func(message forum.Message) {
 		t.publish(Event{Kind: "forum", AgentID: message.AgentID, Phase: message.Stage, Forum: &message})
+		if message.AgentID != phaseModerator {
+			t.wakeModerator()
+		}
 	})
+	t.board.SetOnConsensus(func(stage string) {
+		t.cancelStageWorkers(stage)
+	})
+}
+
+func (t *Team) cancelStageWorkers(stage string) {
+	t.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(t.workerCancels[stage]))
+	for _, cancel := range t.workerCancels[stage] {
+		cancels = append(cancels, cancel)
+	}
+	t.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 }
 
 func (t *Team) publish(e Event) {
@@ -115,6 +163,15 @@ func (t *Team) SetWorkspace(workspace string) error {
 	for _, w := range t.workers {
 		_ = w.agent.tools.Close()
 	}
+	if t.moderator != nil {
+		_ = t.moderator.agent.tools.Close()
+		t.moderator = nil
+	}
+	t.revocations = nil
+	t.pendingAssignments = nil
+	t.ircMessages, t.ircNextID = nil, 0
+	t.stageOpen = false
+	t.signalIRCLocked()
 	t.workers = nil
 	t.phase, t.input, t.handoff = phaseRecon, "", ""
 	t.snapshot = tools.Snapshot{}
@@ -132,7 +189,10 @@ func (t *Team) Statuses() []WorkerStatus { t.mu.Lock(); defer t.mu.Unlock(); ret
 func (t *Team) statusesLocked() []WorkerStatus {
 	out := make([]WorkerStatus, 0, len(t.workers))
 	for _, w := range t.workers {
-		out = append(out, w.saved.Status)
+		out = append(out, cloneWorkerStatus(w.saved.Status))
+	}
+	if t.moderator != nil {
+		out = append(out, cloneWorkerStatus(t.moderator.saved.Status))
 	}
 	return out
 }
@@ -191,17 +251,57 @@ func (t *Team) capture(w *teamWorker, a *Agent) {
 	t.mu.Lock()
 	cp.Status.Name = a.board.Name(a.id)
 	cp.Status.Status, cp.Status.Activity = w.saved.Status.Status, w.saved.Status.Activity
+	cp.Status.Generation = cloneGeneration(w.saved.Status.Generation)
+	cp.Status.LastModelActivity = w.saved.Status.LastModelActivity
+	cp.Status.LastToolActivity = w.saved.Status.LastToolActivity
+	cp.Status.LastTool = w.saved.Status.LastTool
+	cp.Status.OutputExcerpt = w.saved.Status.OutputExcerpt
+	cp.Status.OutputPartial = w.saved.Status.OutputPartial
+	cp.ModeratorSuggestions = w.saved.ModeratorSuggestions
 	w.saved = cp
+	if cp.Completed {
+		t.signalIRCLocked()
+	}
 	t.snapshot = t.aggregateLocked()
 	t.mu.Unlock()
 }
 
 func (t *Team) receive(w *teamWorker, e Event) {
-	switch e.Kind {
-	case "think_delta", "assistant_delta", "tool_call_delta", "assistant_done", "assistant":
+	if e.Kind == "think_delta" || e.Kind == "assistant_delta" || e.Kind == "tool_call_delta" || e.Kind == "assistant_done" || e.Kind == "assistant" {
+		t.mu.Lock()
+		if e.Content != "" {
+			w.saved.Status.OutputExcerpt = boundedExcerpt(w.saved.Status.OutputExcerpt+e.Content, 2048)
+			w.saved.Status.OutputPartial = true
+		}
+		if e.Kind == "assistant_done" || e.Kind == "assistant" {
+			w.saved.Status.OutputPartial = false
+		}
+		t.mu.Unlock()
 		return
 	}
+	protocolFailure := e.Kind == "error" && errors.Is(w.agent.runErr, ErrToolProtocolFailures)
 	t.mu.Lock()
+	if e.Kind == "model_progress" {
+		w.saved.Status.Generation = cloneGeneration(e.Generation)
+		if e.Generation != nil {
+			if e.Generation.ReceivedAt != "" {
+				w.saved.Status.LastModelActivity = e.Generation.ReceivedAt
+			} else {
+				w.saved.Status.OutputExcerpt = ""
+				w.saved.Status.OutputPartial = true
+			}
+		}
+		e.AgentID, e.Phase = w.saved.Status.ID, w.saved.Status.Phase
+		e.Workers = t.statusesLocked()
+		t.mu.Unlock()
+		t.publish(e)
+		return
+	}
+	var cancel context.CancelFunc
+	if protocolFailure {
+		cancel = t.cancel
+		e.Content += "；整个团队已暂停（包括版主）。请检查模型与所选 API 的原生工具适配，修正后输入 go 继续。"
+	}
 	if e.Kind == "turn" {
 		w.saved.Status.Turn = w.agent.turn
 		w.saved.Status.Activity = "思考中"
@@ -221,6 +321,10 @@ func (t *Team) receive(w *teamWorker, e Event) {
 			w.saved.Status.Status = "waiting"
 		} else if e.Kind == "worker" || e.Kind == "tool" {
 			w.saved.Status.Status = "running"
+			if e.Kind == "tool" && strings.HasPrefix(e.Content, "calling ") {
+				w.saved.Status.LastToolActivity = time.Now().Format(time.RFC3339Nano)
+				w.saved.Status.LastTool = strings.TrimPrefix(e.Content, "calling ")
+			}
 		}
 		activity := e.Content
 		if e.Kind == "verify_progress" || e.Kind == "verify_done" {
@@ -237,53 +341,41 @@ func (t *Team) receive(w *teamWorker, e Event) {
 		e.Workers = t.statusesLocked()
 	}
 	t.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	t.publish(e)
 }
 
-var reconFocus = []string{"架构、入口、配置与信任边界", "认证、授权、会话与敏感资产", "外部输入、数据流、数据库与危险 sink", "文件操作、上传、插件、依赖及跨模块边界"}
-var auditFocus = []string{"入口可达性和身份权限", "跨文件数据传播和输入校验", "危险 sink 与实际影响", "否定条件、边界条件和相邻同类路径"}
+func stageAssignment(stage string, count int) string {
+	assignment := fmt.Sprintf("本阶段有 %d 个独立 Agent。系统不预设角色、主题或文件范围。先调用 forum_roster 和 forum_threads 查看同伴，再通过 forum_post 提出候选分工；需要强提醒所有 Agent 时在正文加入 @全体成员（也支持 @all），收到提醒的 Agent 自主决定是否回应；随后用 forum_wait 等待同伴回复（等待有界，超时后继续），根据实际回复自行协商认领范围，避免重复并主动覆盖空白。不要把内部路由 ID 或启动顺序当作分工。名字在后台单独选择，不要调用或等待命名。", count)
+	if stage == phaseAudit {
+		assignment += "这是全新的审计团队：先调用 read_handoff 按需读取结构化侦察资料，再根据论坛协商结果用 file_review_update 自行选择需要审计的文件；不要假设系统预先分配了任何文件。"
+	} else {
+		assignment += "当前是侦察阶段：自行选择建图重点，并把跨范围问题发到论坛；只提交结构化侦察交接，不提交漏洞结论。"
+	}
+	return assignment
+}
 
 // Called only at a stage barrier, never while a worker is running.
 func (t *Team) createStageLocked(stage string) {
-	count, focus := t.cfg.Agent.ReconAgents, reconFocus
+	count := t.cfg.Agent.ReconAgents
 	if stage == phaseAudit {
-		count, focus = t.cfg.Agent.AuditAgents, auditFocus
+		count = t.cfg.Agent.AuditAgents
 	}
-	var paths []string
-	if stage == phaseAudit {
-		set := map[string]bool{}
-		for _, w := range t.workers {
-			if w.saved.Plan != nil {
-				for _, p := range w.saved.Plan.AuditFiles {
-					set[p] = true
-				}
-			}
-		}
-		for p := range set {
-			paths = append(paths, p)
-		}
-		sort.Strings(paths)
-	}
+	assignment := stageAssignment(stage, count)
 	for i := 0; i < count; i++ {
 		id := fmt.Sprintf("%s-%d", stage, i+1)
 		a := newWorker(t.cfg, t.prompts, t.client, t.compressClient, t.registry.Fork(), id, stage, t.board)
 		a.nameClient = t.nameClient
-		a.assignment = fmt.Sprintf("本阶段有 %d 个独立 Agent，你是第 %d 个；重点：%s。名字在后台单独选择，不要调用或等待命名。立即用 forum_roster 查看同伴，在 forum_post 声明负责范围，避免重复；跨范围证据必须主动交流。", count, i+1, focus[i%len(focus)])
+		a.onDisconnect = t.modelDisconnected
+		a.assignment = assignment
 		if stage == phaseAudit {
 			a.handoff = t.handoff
-			var assigned []string
-			for j, p := range paths {
-				if j%count == i {
-					assigned = append(assigned, p)
-				}
-			}
-			if len(assigned) > 0 {
-				a.tools.ApplyAuditScope(assigned)
-			}
-			a.assignment += " 已将你的首要负责文件写入 review_state；必须审完，不得只检查重点方向。可跨文件读取和交叉复核；若未分配文件，独立复核其他人的链路并通过论坛反馈。read_handoff 包含所有侦察 Agent 的地图、笔记、待办和未决问题。"
 		}
 		w := &teamWorker{agent: a, saved: workerSession{Status: WorkerStatus{ID: id, Phase: stage, Status: "pending"}, Assignment: a.assignment, Snapshot: cloneSnapshot(a.tools.Snapshot())}}
 		a.checkpoint = func(a *Agent) { t.capture(w, a) }
+		t.bindIRC(w)
 		t.workers = append(t.workers, w)
 	}
 	t.snapshot = t.aggregateLocked()
@@ -313,10 +405,14 @@ func (t *Team) Run(ctx context.Context, input string, emit func(Event)) {
 	t.running = true
 	t.done = make(chan struct{})
 	t.emitter = emit
+	if t.workerCancels == nil {
+		t.workerCancels = make(map[string]map[string]context.CancelFunc)
+	}
 	if t.input == "" {
 		t.input = input
 	}
 	if t.phase == "completed" {
+		t.board.ResetConsensus(phaseAudit)
 		t.phase = phaseAudit
 		for _, w := range t.workers {
 			if w.saved.Status.Phase == phaseAudit {
@@ -331,89 +427,126 @@ func (t *Team) Run(ctx context.Context, input string, emit func(Event)) {
 	if len(t.workers) == 0 {
 		t.createStageLocked(phaseRecon)
 	}
+	t.ensureModeratorLocked()
 	t.mu.Unlock()
 	t.emitMu.Unlock()
 	defer func() {
 		t.emitMu.Lock()
 		t.mu.Lock()
+		// Moderator is already drained by the later-registered defer below.
 		cancelRun()
 		t.cancel = nil
 		t.running = false
+		t.stageOpen = false
+		for i := range t.ircMessages {
+			m := &t.ircMessages[i]
+			if m.State == "queued" || m.State == "delivered" {
+				m.Error = "cancelled: team paused; delivery/reply retained for resume"
+				t.changeIRCLocked(m)
+			}
+		}
 		t.emitter = nil
 		close(t.done)
 		t.mu.Unlock()
 		t.emitMu.Unlock()
 	}()
+	stopModerator := t.startModerator(runCtx)
+	defer func() { stopModerator() }()
 	for {
 		t.mu.Lock()
 		stage := t.phase
-		var active []*teamWorker
-		for _, w := range t.workers {
-			if w.saved.Status.Phase == stage && !w.saved.Completed {
-				w.saved.Status.Status = "running"
-				active = append(active, w)
-			}
-		}
-		original := t.input
 		t.mu.Unlock()
-		for _, w := range active {
-			t.board.SetStatus(w.agent.id, "running")
-		}
-		t.emitState()
-		_, _ = t.board.Post("coordinator", "system", "*", 0, "阶段调度", fmt.Sprintf("%s 阶段启动，%d 个独立 Agent 并发工作。", stage, len(active)))
-		var wg sync.WaitGroup
-		for _, w := range active {
-			wg.Add(1)
-			go func(w *teamWorker) {
-				defer wg.Done()
-				defer func() {
-					if recovered := recover(); recovered != nil {
-						w.agent.runErr = fmt.Errorf("worker panic: %v", recovered)
-					}
-					t.capture(w, w.agent)
-					status, activity := "completed", "阶段完成"
-					if !w.agent.completed {
-						status, activity = "failed", "阶段未完成"
-						if w.agent.runErr != nil {
-							activity = w.agent.runErr.Error()
-						}
-						if runCtx.Err() != nil {
-							status = "cancelled"
-						}
-					}
-					t.mu.Lock()
-					w.saved.Status.Status = status
-					w.saved.Status.Activity = shortText(activity, 200)
-					t.snapshot = t.aggregateLocked()
-					t.mu.Unlock()
-					t.board.SetStatus(w.agent.id, status)
-					t.emitState()
-				}()
-				instruction := "原始审计目标：\n" + original
-				if input != original {
-					instruction += "\n\n本次补充要求：\n" + input
-				}
-				w.agent.Run(runCtx, instruction, func(e Event) { t.receive(w, e) })
-			}(w)
-		}
-		wg.Wait()
-		t.mu.Lock()
-		complete := true
-		for _, w := range t.workers {
-			if w.saved.Status.Phase == stage && !w.saved.Completed {
-				complete = false
+		stopActors := t.startStageActors(runCtx, stage, input)
+		_, _ = t.board.Post("coordinator", "system", "*", 0, "阶段调度", stage+" 阶段启动；完成成员在阶段屏障前仍可回答 IRC。")
+		approved, complete := false, false
+		for {
+			if !t.waitStageIdle(runCtx, stage) {
+				break
 			}
+			t.mu.Lock()
+			complete = true
+			for _, w := range t.workers {
+				if w.saved.Status.Phase == stage && !w.saved.Completed {
+					complete = false
+				}
+			}
+			if complete && stage == phaseRecon {
+				// Reconnaissance hands off candidates; it does not prove them first.
+				approved = true
+				t.stageOpen = false
+				t.mu.Unlock()
+				break
+			}
+			t.mu.Unlock()
+			if complete {
+				approved = t.reviewStage(runCtx, stage)
+			}
+			if !t.waitStageIdle(runCtx, stage) {
+				break
+			}
+			t.mu.Lock()
+			busy := t.stagePendingIRCLocked(stage) || t.ircPublishing > 0
+			for _, w := range t.workers {
+				if w.saved.Status.Phase == stage && w.active {
+					busy = true
+				}
+			}
+			if busy {
+				t.mu.Unlock()
+				continue
+			}
+			for _, assignments := range t.pendingAssignments {
+				if len(assignments) > 0 {
+					approved = false
+				}
+			}
+			// Atomic admission boundary: a send is either drained in this stage or rejected.
+			t.stageOpen = false
+			t.mu.Unlock()
+			break
 		}
+		t.mu.Lock()
+		t.stageOpen = false
+		t.mu.Unlock()
+		if stage == phaseRecon && complete {
+			stopModerator()
+		}
+		stopActors()
+		t.mu.Lock()
 		if runCtx.Err() != nil || !complete {
 			t.mu.Unlock()
 			t.emitState()
 			return
 		}
+		if !approved {
+			reopened := t.applyModeratorAssignmentsLocked(stage)
+			t.mu.Unlock()
+			if reopened {
+				t.board.ResetConsensus(stage)
+				continue
+			}
+			t.emitState()
+			return
+		}
 		if stage == phaseRecon {
+			for i := range t.ircMessages {
+				m := &t.ircMessages[i]
+				if m.Stage == phaseRecon && (m.State == "queued" || m.State == "delivered") {
+					m.State, m.Error = "failed", "侦察交接已完成；未回复 IRC 已转入审计交接，不再等待侦察成员"
+					t.changeIRCLocked(m)
+				}
+			}
+			for _, w := range t.workers {
+				if w.saved.Status.Phase == phaseRecon {
+					w.saved.ModeratorSuggestions = append(w.saved.ModeratorSuggestions, t.pendingAssignments[w.saved.Status.ID]...)
+					delete(t.pendingAssignments, w.saved.Status.ID)
+				}
+			}
 			t.handoff = t.buildHandoffLocked()
 			t.phase = phaseAudit
 			t.createStageLocked(phaseAudit)
 			t.mu.Unlock()
+			stopModerator = t.startModerator(runCtx)
 			_, _ = t.board.Post("coordinator", "system", "*", 0, "阶段交接", "全部侦察 Agent 已完成；新建审计 Agent，按需继承结构化地图、笔记、待办与论坛，不继承原始对话。")
 			continue
 		}
@@ -427,17 +560,28 @@ func (t *Team) Run(ctx context.Context, input string, emit func(Event)) {
 
 func (t *Team) buildHandoffLocked() string {
 	type entry struct {
-		AgentID  string             `json:"agent_id"`
-		Plan     *auditPlanDoneArgs `json:"plan"`
-		Snapshot tools.Snapshot     `json:"snapshot"`
+		AgentID              string             `json:"agent_id"`
+		Plan                 *auditPlanDoneArgs `json:"plan"`
+		Snapshot             tools.Snapshot     `json:"snapshot"`
+		ModeratorSuggestions []string           `json:"moderator_suggestions,omitempty"`
+		IRC                  []IRCMessage       `json:"irc,omitempty"`
 	}
 	entries := make([]entry, 0, t.cfg.Agent.ReconAgents)
 	for _, w := range t.workers {
 		if w.saved.Status.Phase == phaseRecon {
-			entries = append(entries, entry{w.saved.Status.ID, w.saved.Plan, w.saved.Snapshot})
+			e := entry{AgentID: w.saved.Status.ID, Plan: w.saved.Plan, Snapshot: w.saved.Snapshot, ModeratorSuggestions: w.saved.ModeratorSuggestions}
+			if pending := t.pendingAssignments[w.saved.Status.ID]; len(pending) > 0 {
+				e.ModeratorSuggestions = append(append([]string(nil), e.ModeratorSuggestions...), pending...)
+			}
+			for _, m := range t.ircMessages {
+				if m.Stage == phaseRecon && m.AgentID == e.AgentID {
+					e.IRC = append(e.IRC, m)
+				}
+			}
+			entries = append(entries, e)
 		}
 	}
-	data, _ := json.Marshal(tools.Result{OK: true, Data: entries, Message: "完整侦察交接；候选风险需独立读取源码验证。论坛记录仍可通过 forum_read 分页读取。"})
+	data, _ := json.Marshal(tools.Result{OK: true, Data: entries, Message: "完整侦察交接；候选风险、管理员建议与未回复 IRC 都是待核实材料，由审计成员自行协商认领，不是已验证事实或固定分工。论坛记录仍可通过 forum_read 分页读取。"})
 	return string(data)
 }
 
@@ -454,6 +598,11 @@ func (t *Team) Close() error {
 	var first error
 	for _, w := range t.workers {
 		if err := w.agent.tools.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	if t.moderator != nil {
+		if err := t.moderator.agent.tools.Close(); err != nil && first == nil {
 			first = err
 		}
 	}
@@ -508,6 +657,7 @@ func (t *Team) aggregateLocked() tools.Snapshot {
 		for _, f := range s.Snapshot.Findings {
 			key := fmt.Sprintf("%s:%d:%s:%s", f.Path, f.Line, strings.ToLower(f.Title), f.CWE)
 			if _, ok := findings[key]; !ok {
+				f.Key = findingKey(f)
 				f.ID = len(out.Findings) + 1
 				f.Evidence = "[" + id + "] " + f.Evidence
 				findings[key] = len(out.Findings)
@@ -547,7 +697,8 @@ func (t *Team) aggregateLocked() tools.Snapshot {
 	}
 	sort.Slice(out.Files, func(i, j int) bool { return out.Files[i].Path < out.Files[j].Path })
 	out.Project.Note = strings.Join(notes, "\n\n")
-	out.Audit = tools.AuditState{Ended: stage == phaseAudit && count > 0 && allDone, Summary: strings.Join(summaries, "\n\n"), NextSteps: strings.Join(next, "\n\n")}
+	out.Audit = tools.AuditState{Ended: t.phase == "completed" && stage == phaseAudit && count > 0 && allDone, Summary: strings.Join(summaries, "\n\n"), NextSteps: strings.Join(next, "\n\n")}
+	t.applyRevocationsLocked(&out)
 	return out
 }
 func fileStatusRank(s string) int {

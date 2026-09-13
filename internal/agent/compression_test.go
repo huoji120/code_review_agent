@@ -39,7 +39,7 @@ func TestManySmallTurnsKeepHistoryPrefixWithoutPeriodicCompaction(t *testing.T) 
 	calls := 0
 	var prior []llm.Message
 	var a *Agent
-	client := &noticeClient{call: func(_ context.Context, messages []llm.Message) (string, error) {
+	client := &noticeClient{tools: func(_ context.Context, messages []llm.Message) (llm.ToolResponse, error) {
 		calls++
 		if len(messages) < len(prior) || !reflect.DeepEqual(messages[:len(prior)], prior) && len(prior) > 0 {
 			t.Fatal("ordinary turn rewrote or dropped an earlier history prefix")
@@ -47,7 +47,7 @@ func TestManySmallTurnsKeepHistoryPrefixWithoutPeriodicCompaction(t *testing.T) 
 		prior = append([]llm.Message(nil), messages...)
 		// Changed metadata must not rewrite an existing request prefix.
 		a.prompts.System = "new metadata for the next compressed prefix"
-		return "continue", nil
+		return toolReply("review_state", map[string]any{"limit": 1}), nil
 	}}
 	compressor := &noticeClient{call: func(context.Context, []llm.Message) (string, error) {
 		t.Fatal("small turns triggered periodic compression")
@@ -72,10 +72,10 @@ func TestTokenThresholdExactBoundaryAndStablePrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.messages = []llm.Message{{Role: llm.RoleSystem, Content: "fixed prefix"}, {Role: llm.RoleUser}}
-	padding := limit - 1 - estimateTokens(a.messages)
+	padding := limit - 1 - estimateTokens(a.messages) - a.toolDefinitionTokens()
 	a.messages[1].Content = strings.Repeat("界", padding)
 	before := append([]llm.Message(nil), a.messages...)
-	if estimateTokens(a.messages) != limit-1 {
+	if estimateTokens(a.messages)+a.toolDefinitionTokens() != limit-1 {
 		t.Fatal("boundary fixture has wrong estimate")
 	}
 	if err := a.compressIfNeeded(context.Background(), func(Event) {}); err != nil || calls != 0 || !reflect.DeepEqual(a.messages, before) {
@@ -85,7 +85,7 @@ func TestTokenThresholdExactBoundaryAndStablePrefix(t *testing.T) {
 	if err := a.compressIfNeeded(context.Background(), func(Event) {}); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 1 || estimateTokens(a.messages) >= limit {
+	if calls != 1 || estimateTokens(a.messages)+a.toolDefinitionTokens() >= limit {
 		t.Fatal("T did not compact to below admission limit")
 	}
 	if err := a.compressIfNeeded(context.Background(), func(Event) {}); err != nil || calls != 1 {

@@ -20,11 +20,6 @@ type traceLog struct {
 	mu      sync.Mutex
 }
 
-type traceChatMessage struct {
-	Role    llm.Role `json:"role"`
-	Content string   `json:"content"`
-}
-
 func newTraceLog(dir string) (*traceLog, error) {
 	if dir == "" {
 		dir = "log_sessions"
@@ -107,7 +102,7 @@ func (l *traceLog) AppendMessage(message llm.Message) error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	payload, err := json.Marshal(traceChatMessage{Role: message.Role, Content: message.Content})
+	payload, err := json.Marshal(message)
 	if err != nil {
 		return err
 	}

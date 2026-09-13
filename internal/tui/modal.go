@@ -23,6 +23,7 @@ type modalState struct {
 	editor    textarea.Model
 	err       string
 	findings  *findingsModal
+	agents    bool
 }
 
 func (m *Model) openBroadcast(value string) tea.Cmd {

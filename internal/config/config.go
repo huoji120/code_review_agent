@@ -5,7 +5,6 @@ import (
 	"math"
 	"os"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -41,18 +40,20 @@ type PromptConfig struct {
 }
 
 type AgentConfig struct {
-	MaxTurns             int     `yaml:"max_turns"`
-	SessionDir           string  `yaml:"session_dir"`
-	LogSession           bool    `yaml:"log_session"`
-	LogSessionDir        string  `yaml:"log_session_dir"`
-	RetryAttempts        int     `yaml:"retry_attempts"`
-	CompressAtRatio      float64 `yaml:"compress_at_ratio"`
-	CompressBufferTokens int     `yaml:"compress_buffer_tokens"`
-	AutoPlan             bool    `yaml:"auto_plan"`
-	MaxToolResultChars   int     `yaml:"max_tool_result_chars"`
-	ReconAgents          int     `yaml:"recon_agents"`
-	AuditAgents          int     `yaml:"audit_agents"`
-	ForumWaitSeconds     int     `yaml:"forum_wait_seconds"`
+	MaxTurns                 int     `yaml:"max_turns"`
+	SessionDir               string  `yaml:"session_dir"`
+	LogSession               bool    `yaml:"log_session"`
+	LogSessionDir            string  `yaml:"log_session_dir"`
+	RetryAttempts            int     `yaml:"retry_attempts"`
+	CompressAtRatio          float64 `yaml:"compress_at_ratio"`
+	CompressBufferTokens     int     `yaml:"compress_buffer_tokens"`
+	AutoPlan                 bool    `yaml:"auto_plan"`
+	MaxToolResultChars       int     `yaml:"max_tool_result_chars"`
+	ReconAgents              int     `yaml:"recon_agents"`
+	AuditAgents              int     `yaml:"audit_agents"`
+	ForumWaitSeconds         int     `yaml:"forum_wait_seconds"`
+	ModeratorEnabled         *bool   `yaml:"moderator_enabled"`
+	ModeratorIntervalSeconds int     `yaml:"moderator_interval_seconds"`
 }
 
 func Load(path string) (Config, error) {
@@ -90,8 +91,11 @@ func Load(path string) (Config, error) {
 		}
 	}
 	applyDefaults(&cfg)
-	if cfg.Agent.ReconAgents < 1 || cfg.Agent.ReconAgents > 32 || cfg.Agent.AuditAgents < 1 || cfg.Agent.AuditAgents > 32 {
-		return Config{}, fmt.Errorf("agent.recon_agents and agent.audit_agents must be between 1 and 32")
+	if cfg.Agent.ReconAgents < 1 || cfg.Agent.ReconAgents > 666 || cfg.Agent.AuditAgents < 1 || cfg.Agent.AuditAgents > 666 {
+		return Config{}, fmt.Errorf("agent.recon_agents and agent.audit_agents must be between 1 and 666")
+	}
+	if cfg.Agent.ModeratorIntervalSeconds < 1 || cfg.Agent.ModeratorIntervalSeconds > 86400 {
+		return Config{}, fmt.Errorf("agent.moderator_interval_seconds must be between 1 and 86400")
 	}
 	if cfg.Agent.ForumWaitSeconds < 1 || cfg.Agent.ForumWaitSeconds > 120 {
 		return Config{}, fmt.Errorf("agent.forum_wait_seconds must be between 1 and 120")
@@ -198,7 +202,7 @@ func applyDefaults(cfg *Config) {
 		cfg.OpenAI.TopP = 1
 	}
 	if cfg.OpenAI.TimeoutSeconds == 0 {
-		cfg.OpenAI.TimeoutSeconds = int((120 * time.Second).Seconds())
+		cfg.OpenAI.TimeoutSeconds = 10
 	}
 	applyCompressOpenAIDefaults(cfg)
 	if cfg.Prompts.System == "" {
@@ -240,9 +244,16 @@ func applyDefaults(cfg *Config) {
 	if cfg.Agent.AuditAgents == 0 {
 		cfg.Agent.AuditAgents = 4
 	}
-	if cfg.Agent.ForumWaitSeconds == 0 {
-		cfg.Agent.ForumWaitSeconds = 30
+	if cfg.Agent.ModeratorIntervalSeconds == 0 {
+		cfg.Agent.ModeratorIntervalSeconds = 60
 	}
+	if cfg.Agent.ForumWaitSeconds == 0 {
+		cfg.Agent.ForumWaitSeconds = 60
+	}
+}
+
+func (cfg AgentConfig) ModeratorIsEnabled() bool {
+	return cfg.ModeratorEnabled == nil || *cfg.ModeratorEnabled
 }
 
 func applyCompressOpenAIDefaults(cfg *Config) {

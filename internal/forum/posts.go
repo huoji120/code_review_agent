@@ -48,12 +48,17 @@ func GroupPosts(messages []Message) []Post {
 		} else {
 			p.Replies = append(p.Replies, m)
 		}
+		// Mirror state even when retention removed the original root.
+		copyModeration(&p.Root, m)
 		if m.CreatedAt.After(p.UpdatedAt) || (m.CreatedAt.Equal(p.UpdatedAt) && m.ID > p.LastID) {
 			p.UpdatedAt = m.CreatedAt
 			p.LastID = m.ID
 		}
 	}
 	sort.Slice(posts, func(i, j int) bool {
+		if posts[i].Root.Pinned != posts[j].Root.Pinned {
+			return posts[i].Root.Pinned
+		}
 		if posts[i].UpdatedAt.Equal(posts[j].UpdatedAt) {
 			return posts[i].LastID > posts[j].LastID
 		}
@@ -76,6 +81,10 @@ type postSummary struct {
 	LatestMessageID  int64     `json:"latest_message_id"`
 	UpdatedAt        time.Time `json:"updated_at"`
 	RootMissing      bool      `json:"root_missing"`
+	Closed           bool      `json:"closed"`
+	Pinned           bool      `json:"pinned"`
+	Announcement     bool      `json:"announcement"`
+	ModerationReason string    `json:"moderation_reason,omitempty"`
 }
 
 const DefaultPageSize = 60
@@ -195,7 +204,7 @@ func (b *Board) threadPage(raw json.RawMessage) string {
 		m := postExcerpt(post, query)
 		preview := matchingExcerpt(m.Content, query, 256)
 		previewTopic := matchingExcerpt(m.Topic, query, 128)
-		out.Posts = append(out.Posts, postSummary{ID: post.ID, Topic: topic, AgentID: post.Root.AgentID, AgentName: post.Root.AgentName, Stage: post.Root.Stage, ReplyCount: len(post.Replies), LatestMessageID: post.LastID, UpdatedAt: post.UpdatedAt, RootMissing: post.RootMissing, Excerpt: preview, ExcerptTopic: previewTopic, ExcerptMessageID: m.ID, ExcerptTruncated: preview != m.Content || previewTopic != m.Topic})
+		out.Posts = append(out.Posts, postSummary{ID: post.ID, Topic: topic, AgentID: post.Root.AgentID, AgentName: post.Root.AgentName, Stage: post.Root.Stage, ReplyCount: len(post.Replies), LatestMessageID: post.LastID, UpdatedAt: post.UpdatedAt, RootMissing: post.RootMissing, Excerpt: preview, ExcerptTopic: previewTopic, ExcerptMessageID: m.ID, ExcerptTruncated: preview != m.Content || previewTopic != m.Topic, Closed: post.Root.Closed, Pinned: post.Root.Pinned, Announcement: post.Root.Announcement, ModerationReason: post.Root.ModerationReason})
 	}
 	return marshal(out)
 }

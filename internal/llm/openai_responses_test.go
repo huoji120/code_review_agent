@@ -22,7 +22,7 @@ func responsesTestClient(t *testing.T, handler http.HandlerFunc, stream bool, ap
 }
 
 func TestResponsesReplaysHistoryAsEasyMessages(t *testing.T) {
-	history := []Message{{RoleSystem, "instructions"}, {RoleUser, "question"}, {RoleAssistant, "prior answer"}, {RoleTool, "tool result"}}
+	history := []Message{{Role: RoleSystem, Content: "instructions"}, {Role: RoleUser, Content: "question"}, {Role: RoleAssistant, Content: "prior answer"}, {Role: RoleTool, Content: "tool result"}}
 	client := responsesTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/responses" {
 			t.Errorf("request path = %s", r.URL.Path)
@@ -193,7 +193,7 @@ func TestExplicitChatCompletionsRemainsAvailable(t *testing.T) {
 				fmt.Fprint(w, `{"choices":[{"message":{"reasoning_content":"thinking","content":"answer"}}]}`)
 			}
 		}, stream, "chat_completions")
-		got, err := client.Chat(context.Background(), []Message{{RoleUser, "question"}})
+		got, err := client.Chat(context.Background(), []Message{{Role: RoleUser, Content: "question"}})
 		if err != nil || got != "<think>thinking</think>answer" {
 			t.Fatalf("explicit chat stream=%v: %q, %v", stream, got, err)
 		}

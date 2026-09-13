@@ -3,6 +3,7 @@ package forum
 import (
 	"encoding/json"
 	"sort"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -68,7 +69,8 @@ func (b *Board) Notification(id string, after int64, budget int) (string, int64)
 	start := sort.Search(len(b.msgs), func(i int) bool { return b.msgs[i].ID > after })
 	for _, m := range b.msgs[start:] {
 		joined := b.participants[m.ThreadID][id]
-		if m.AgentID == id || (m.ReplyTo != 0 && (joined == 0 || joined >= m.ID)) {
+		mentionedAll := strings.Contains(m.Content, "@all") || strings.Contains(m.Content, "@全体成员") || strings.Contains(m.Content, "@全体")
+		if m.AgentID == id || (!mentionedAll && m.ReplyTo != 0 && (joined == 0 || joined >= m.ID)) {
 			p.NextID = m.ID
 			continue
 		}

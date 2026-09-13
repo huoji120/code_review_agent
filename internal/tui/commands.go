@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"code-review-agent/internal/agent"
 	"code-review-agent/internal/forum"
 	"code-review-agent/internal/tools"
 	tea "github.com/charmbracelet/bubbletea"
@@ -16,7 +17,7 @@ import (
 
 func (m *Model) submit(value string) tea.Cmd {
 	command, arg := parseCommand(value)
-	if strings.HasPrefix(value, "/") || command == "go" || command == "restore" || command == "report" || command == "list" || command == "export" || command == "save" || command == "sessions" {
+	if strings.HasPrefix(value, "/") || command == "go" || command == "restore" || command == "report" || command == "list" || command == "export" || command == "save" || command == "sessions" || command == "agents" {
 		switch command {
 		case "say":
 			return m.openBroadcast(arg)
@@ -56,6 +57,7 @@ func (m *Model) submit(value string) tea.Cmd {
 			m.expandedPosts = map[int64]bool{id: true}
 			m.reconcileForum()
 			m.threadID = id
+			m.showForumPost(*selected)
 			m.focus = 1
 			m.scroll[1] = 0
 			m.follow[1] = true
@@ -115,6 +117,8 @@ func (m *Model) submit(value string) tea.Cmd {
 			m.exportReport(arg)
 		case "files":
 			m.showFiles(arg)
+		case "agents":
+			m.showAgents()
 		case "help":
 			m.showDetail("操作帮助", []string{
 				"输入目录或 /dir <目录>：开始新审计；支持带空格的引号路径。",
@@ -123,7 +127,7 @@ func (m *Model) submit(value string) tea.Cmd {
 				"/thread <ID>：展开帖子及楼内回复；/forum [页码]：返回倒序帖子列表。",
 				fmt.Sprintf("/search <关键词>：搜索标题、正文与回复；/search 清除；每页 %d 帖。", forum.DefaultPageSize),
 				"/reply <ID> <内容>：回复帖子；论坛 Home/End 跳至当前页首/尾。",
-				"/help、/report、/files [页码]、/sessions：独立可滚动对话框。",
+				"/help、/agents、/report、/files [页码]、/sessions：独立可滚动对话框。",
 				"/list [页码]：漏洞选择列表；↑↓ 选择、Enter 详情、Esc 返回/关闭；后台继续运行。",
 				"/export [文件]：完整 JSON 报告，默认 report.json。",
 				"/save [文件]：保存当前会话；/sessions [页码]：列出会话。",
@@ -280,6 +284,53 @@ func (m *Model) showDetail(title string, lines []string) {
 	m.input.Blur()
 	m.resizeModal()
 }
+
+func (m *Model) showAgents() {
+	m.showDetail("Agent 列表 /agents", m.agentDetailLines())
+	m.modal.agents = true
+}
+
+func (m *Model) agentDetailLines() []string {
+	statuses := m.workers
+	lines := []string{fmt.Sprintf("当前阶段：%s · worker 数：%d", m.runner.Phase(), len(statuses))}
+	if len(statuses) == 0 {
+		lines = append(lines, "当前没有已创建的 Agent。")
+	} else {
+		for _, status := range statuses {
+			name := status.Name
+			if name == "" {
+				name = "未命名（" + status.ID + "）"
+			}
+			activity := status.Activity
+			if activity == "" {
+				activity = "暂无活动"
+			}
+			lines = append(lines, fmt.Sprintf("%s [%s] · 阶段 %s · #%d · %s", name, status.Status, status.Phase, status.Turn, activity))
+			if status.Generation != nil {
+				progress := status.Generation
+				line := generationLabel(progress) + fmt.Sprintf(" · reasoning %d tok", progress.ReasoningTokens)
+				if progress.Estimated {
+					line += fmt.Sprintf(" · tool≈%d tok（UTF-8 字节估算；当前请求输出，非上下文）", progress.ToolTokens)
+				} else {
+					line += "（提供方用量；当前请求输出，非上下文）"
+				}
+				lines = append(lines, line)
+				if progress.ReceivedAt == "" {
+					lines = append(lines, "当前请求等待首段输出；尚无输出数据时间。")
+				} else {
+					lines = append(lines, "当前请求最后输出数据："+progress.ReceivedAt)
+				}
+			}
+			if status.LastModelActivity != "" {
+				lines = append(lines, "最近模型输出："+status.LastModelActivity)
+			}
+			if status.LastToolActivity != "" {
+				lines = append(lines, "最近工具："+status.LastTool+" · "+status.LastToolActivity)
+			}
+		}
+	}
+	return lines
+}
 func (m *Model) listSessions(arg string) {
 	entries, err := os.ReadDir(m.sessionDir)
 	if err != nil {
@@ -333,6 +384,7 @@ func (m *Model) exportReport(path string) {
 		path = cleanInputDir(path)
 	}
 	snapshot := m.runner.Snapshot()
+	revocations := m.runner.Revocations()
 	files := reportFiles{Reviewed: []tools.FileReview{}, Unreviewed: []tools.FileReview{}}
 	for _, f := range snapshot.Files {
 		if f.Status == "reviewed" || f.Status == "skipped" {
@@ -344,16 +396,17 @@ func (m *Model) exportReport(path string) {
 	// Preserve every previous report field, and include project notes that were
 	// formerly available only through session persistence. UI truncation is not used.
 	report := struct {
-		GeneratedAt string                 `json:"generated_at"`
-		Audit       tools.AuditState       `json:"audit"`
-		Count       int                    `json:"count"`
-		Findings    []tools.Finding        `json:"findings"`
-		Todos       []tools.Todo           `json:"todos"`
-		Files       reportFiles            `json:"files"`
-		Variables   []tools.VariableReview `json:"variables"`
-		Flows       []tools.FlowReview     `json:"flows"`
-		Project     tools.ProjectNote      `json:"project_note"`
-	}{time.Now().Format(time.RFC3339), snapshot.Audit, len(snapshot.Findings), snapshot.Findings, snapshot.Todos, files, snapshot.Variables, snapshot.Flows, snapshot.Project}
+		GeneratedAt string                    `json:"generated_at"`
+		Audit       tools.AuditState          `json:"audit"`
+		Count       int                       `json:"count"`
+		Findings    []tools.Finding           `json:"findings"`
+		Revocations []agent.FindingRevocation `json:"revocations"`
+		Todos       []tools.Todo              `json:"todos"`
+		Files       reportFiles               `json:"files"`
+		Variables   []tools.VariableReview    `json:"variables"`
+		Flows       []tools.FlowReview        `json:"flows"`
+		Project     tools.ProjectNote         `json:"project_note"`
+	}{time.Now().Format(time.RFC3339), snapshot.Audit, len(snapshot.Findings), snapshot.Findings, revocations, snapshot.Todos, files, snapshot.Variables, snapshot.Flows, snapshot.Project}
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err == nil {
 		err = os.WriteFile(path, data, 0600)

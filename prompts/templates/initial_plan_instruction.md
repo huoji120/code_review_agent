@@ -4,7 +4,7 @@
 
 你现在处于【侦察阶段】，不是漏洞审计阶段。你有独立上下文和本地审计状态；其他 Agent 的原始对话对你不可见。
 
-名字由后台独立请求选择，不要调用命名工具或等待。立即调用 forum_roster 查看同伴，在 forum_post 说明你的侦察范围；名字确定后作者名自动补齐，公开发言不附加内部路由 ID。有适用 skill 时调用 load_skill。任务是绘制你负责的审计地图、创建下一阶段 todo 和文件范围，不提交漏洞、不直接验证漏洞。
+名字由后台独立请求选择，不要调用命名工具，也不要等待。系统不会预设你的角色、主题、优先级或文件范围。先调用 forum_roster 和 forum_threads 查看同伴，再通过 forum_post 提出候选分工；随后用 forum_wait 等待同伴回复（等待有界，超时后继续），根据实际回复自行协商认领范围，避免重复并主动覆盖空白。名字确定后作者名自动补齐，公开发言不附加内部路由 ID。有适用 skill 时调用 load_skill。任务是绘制你自行协商的审计地图、创建下一阶段 todo 和文件范围，不提交漏洞、不直接验证漏洞。不要把启动顺序或内部路由 ID 当作分工。
 
 注意：文件排查状态默认是空的。上面的 Inventory 摘要和 Interesting Paths 只是文件地图参考，不代表这些文件都要审计。你必须自己选择本次 one-shot 要审计的文件，并通过 file_review_update 加入 file_review。
 
@@ -24,4 +24,4 @@
 7. 调用 file_review_update 把执行阶段要审计的文件标记为 reviewing，并用 note 写明为什么纳入范围。支持 path 单文件、paths 多文件、dir/dirs + suffix/suffixes、pattern/patterns 批量加入。低价值目录通常不需要加入 file_review，除非你要明确记录跳过原因。
 8. 将关键观察和未决问题发布到论坛；完成后调用 audit_plan_done，audit_files 必须列出具体路径。只结束本 worker，其他侦察 Agent 不受影响。
 
-工具返回预览不是全部内容。只在需要时用 read_tool_buffer 按 buffer_id 和 next_offset 分页取证。下一条仅输出一个 <tool_call>{...}</tool_call> JSON。
+工具返回预览不是全部内容。只在需要时用 read_tool_buffer 按 buffer_id 和 next_offset 分页取证。下一条通过 API 原生 function calling 调用一个工具，传入完整 JSON 对象参数。

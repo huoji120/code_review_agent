@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"code-review-agent/internal/forum"
@@ -14,47 +13,66 @@ import (
 )
 
 type workerSession struct {
-	Status        WorkerStatus       `json:"status"`
-	Assignment    string             `json:"assignment"`
-	Messages      []llm.Message      `json:"messages"`
-	Skills        []string           `json:"skills,omitempty"`
-	TracePath     string             `json:"trace_path,omitempty"`
-	Snapshot      tools.Snapshot     `json:"snapshot"`
-	Plan          *auditPlanDoneArgs `json:"plan,omitempty"`
-	Completed     bool               `json:"completed"`
-	ForumCursor   int64              `json:"forum_cursor,omitempty"`
-	ForumPending  string             `json:"forum_pending,omitempty"`
-	AnnouncedName string             `json:"announced_name,omitempty"`
+	Status               WorkerStatus       `json:"status"`
+	Assignment           string             `json:"assignment"`
+	Messages             []llm.Message      `json:"messages"`
+	Skills               []string           `json:"skills,omitempty"`
+	TracePath            string             `json:"trace_path,omitempty"`
+	Snapshot             tools.Snapshot     `json:"snapshot"`
+	Plan                 *auditPlanDoneArgs `json:"plan,omitempty"`
+	ModeratorSuggestions []string           `json:"moderator_suggestions,omitempty"`
+	Completed            bool               `json:"completed"`
+	ForumCursor          int64              `json:"forum_cursor,omitempty"`
+	ForumPending         string             `json:"forum_pending,omitempty"`
+	AnnouncedName        string             `json:"announced_name,omitempty"`
 }
 
 type teamSession struct {
-	Version           int                        `json:"version"`
-	SavedAt           string                     `json:"saved_at"`
-	Workspace         string                     `json:"workspace"`
-	Phase             string                     `json:"phase"`
-	Input             string                     `json:"input"`
-	ReconAgents       int                        `json:"recon_agents"`
-	AuditAgents       int                        `json:"audit_agents"`
-	Workers           []workerSession            `json:"workers"`
-	Forum             []forum.Message            `json:"forum"`
-	ForumNames        map[string]string          `json:"forum_names,omitempty"`
-	ForumParticipants map[int64]map[string]int64 `json:"forum_participants,omitempty"`
+	Version            int                        `json:"version"`
+	SavedAt            string                     `json:"saved_at"`
+	Workspace          string                     `json:"workspace"`
+	Phase              string                     `json:"phase"`
+	Input              string                     `json:"input"`
+	ReconAgents        int                        `json:"recon_agents"`
+	AuditAgents        int                        `json:"audit_agents"`
+	Workers            []workerSession            `json:"workers"`
+	Forum              []forum.Message            `json:"forum"`
+	ForumNames         map[string]string          `json:"forum_names,omitempty"`
+	ForumParticipants  map[int64]map[string]int64 `json:"forum_participants,omitempty"`
+	Moderator          *workerSession             `json:"moderator,omitempty"`
+	Revocations        []FindingRevocation        `json:"revocations,omitempty"`
+	PendingAssignments map[string][]string        `json:"pending_assignments,omitempty"`
+	IRC                []IRCMessage               `json:"irc,omitempty"`
+	IRCNextID          int64                      `json:"irc_next_id,omitempty"`
 }
 
 // Saves immutable worker boundaries, including cursor+pending notification pairs.
 func (t *Team) SaveSession(path string) error {
 	t.saveMu.Lock()
 	defer t.saveMu.Unlock()
+	t.ircMu.Lock()
 	t.mu.Lock()
 	s := teamSession{Version: 2, SavedAt: time.Now().Format(time.RFC3339), Workspace: t.registry.Workspace(), Phase: t.phase, Input: t.input, ReconAgents: t.cfg.Agent.ReconAgents, AuditAgents: t.cfg.Agent.AuditAgents}
 	for _, w := range t.workers {
 		s.Workers = append(s.Workers, w.saved)
 	}
+	if t.moderator != nil {
+		saved := t.moderator.saved
+		s.Moderator = &saved
+	}
+	s.Revocations = append([]FindingRevocation(nil), t.revocations...)
+	s.PendingAssignments = make(map[string][]string, len(t.pendingAssignments))
+	for id, assignments := range t.pendingAssignments {
+		s.PendingAssignments[id] = append([]string(nil), assignments...)
+	}
+	s.IRC = append([]IRCMessage(nil), t.ircMessages...)
+	s.IRCNextID = t.ircNextID
 	s.Forum, s.ForumNames, s.ForumParticipants = t.board.Checkpoint()
 	for i := range s.Workers {
 		s.Workers[i].Status.Name = s.ForumNames[s.Workers[i].Status.ID]
 	}
 	t.mu.Unlock()
+	t.ircMu.Unlock()
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
@@ -119,6 +137,31 @@ func (t *Team) LoadSession(path string) error {
 	if s.ReconAgents < 1 || s.ReconAgents > 32 || s.AuditAgents < 1 || s.AuditAgents > 32 {
 		return fmt.Errorf("无效的会话团队规模")
 	}
+	for _, revocation := range s.Revocations {
+		if revocation.Key == "" || revocation.Reason == "" || revocation.Evidence == "" {
+			return fmt.Errorf("invalid finding revocation")
+		}
+	}
+	if s.Moderator != nil && (s.Moderator.Status.ID != phaseModerator || s.Moderator.Status.Phase != phaseModerator || s.Moderator.Status.Name != "论坛管理员") {
+		return fmt.Errorf("invalid moderator identity")
+	}
+	for id, assignments := range s.PendingAssignments {
+		valid := false
+		for _, worker := range s.Workers {
+			if worker.Status.ID == id && worker.Status.Phase == s.Phase {
+				valid = true
+				break
+			}
+		}
+		if !valid || len(assignments) > 8 {
+			return fmt.Errorf("invalid pending moderator assignments")
+		}
+		for _, content := range assignments {
+			if len(content) == 0 || len(content) > 4096 {
+				return fmt.Errorf("invalid moderator assignment content")
+			}
+		}
+	}
 	seen := map[string]bool{}
 	for _, w := range s.Workers {
 		if w.Status.ID == "" || seen[w.Status.ID] || (w.Status.Phase != phaseRecon && w.Status.Phase != phaseAudit) {
@@ -135,6 +178,9 @@ func (t *Team) LoadSession(path string) error {
 	if len(s.Workers) > 64 {
 		return fmt.Errorf("会话 worker 过多")
 	}
+	if err := validateIRCSession(s); err != nil {
+		return err
+	}
 	newRegistry, err := tools.NewRegistry(s.Workspace, t.cfg.Agent.MaxToolResultChars)
 	if err != nil {
 		return fmt.Errorf("恢复工作区: %w", err)
@@ -146,6 +192,7 @@ func (t *Team) LoadSession(path string) error {
 	}
 	checkBoard.Register("user", "user")
 	checkBoard.Register("coordinator", "system")
+	checkBoard.Register(phaseModerator, phaseModerator)
 	for _, stage := range []struct {
 		name  string
 		count int
@@ -157,7 +204,15 @@ func (t *Team) LoadSession(path string) error {
 	if s.ForumNames == nil {
 		s.ForumNames = make(map[string]string)
 	}
-	for _, saved := range s.Workers {
+	allSaved := append([]workerSession(nil), s.Workers...)
+	if s.Moderator != nil {
+		allSaved = append(allSaved, *s.Moderator)
+	}
+	for _, saved := range allSaved {
+		if err := validateNativeHistory(saved.Messages); err != nil {
+			newRegistry.Close()
+			return fmt.Errorf("invalid native history for %s: %w", saved.Status.ID, err)
+		}
 		checkBoard.Register(saved.Status.ID, saved.Status.Phase)
 		if saved.Status.Name != "" {
 			if name := s.ForumNames[saved.Status.ID]; name != "" && name != saved.Status.Name {
@@ -205,34 +260,49 @@ func (t *Team) LoadSession(path string) error {
 	for _, w := range t.workers {
 		_ = w.agent.tools.Close()
 	}
+	if t.moderator != nil {
+		_ = t.moderator.agent.tools.Close()
+	}
 	_ = t.registry.Close()
 	t.registry = newRegistry
 	t.cfg.Agent.ReconAgents = s.ReconAgents
 	t.cfg.Agent.AuditAgents = s.AuditAgents
 	t.phase, t.input, t.handoff = s.Phase, s.Input, ""
 	t.workers = nil
+	t.moderator = nil
+	t.revocations = append([]FindingRevocation(nil), s.Revocations...)
+	t.pendingAssignments = s.PendingAssignments
+	t.ircMessages = append([]IRCMessage(nil), s.IRC...)
+	t.ircNextID = s.IRCNextID
+	t.ircChanged = make(chan struct{})
 	t.resetBoard()
 	_ = t.board.Restore(s.Forum)
-	for _, saved := range s.Workers {
+	for _, saved := range allSaved {
 		t.board.Register(saved.Status.ID, saved.Status.Phase)
 	}
 	_ = t.board.RestoreNames(s.ForumNames)
 	_ = t.board.RestoreParticipants(s.ForumParticipants)
-	for _, saved := range s.Workers {
+	for _, saved := range allSaved {
 		a := newWorker(t.cfg, t.prompts, t.client, t.compressClient, t.registry.Fork(), saved.Status.ID, saved.Status.Phase, t.board)
 		a.nameClient = t.nameClient
+		a.onDisconnect = t.modelDisconnected
 		a.announcedName = saved.AnnouncedName
-		a.assignment = strings.ReplaceAll(saved.Assignment, "首先自行选择唯一名字并调用 forum_register；成功后用 forum_roster", "名字在后台单独选择，不要调用或等待命名。立即用 forum_roster")
+		count := s.ReconAgents
+		if saved.Status.Phase == phaseAudit {
+			count = s.AuditAgents
+		}
+		a.assignment = stageAssignment(saved.Status.Phase, count)
 		saved.Assignment = a.assignment
-		a.plan = saved.Plan
 		a.turn = saved.Status.Turn
 		a.completed = saved.Completed
+		a.plan = saved.Plan
 		a.forumCursor, a.forumPending = saved.ForumCursor, saved.ForumPending
 		saved.Status.Name = t.board.Name(saved.Status.ID)
 		a.tracePath = saved.TracePath
 		a.prompts.SetLoadedSkills(saved.Skills)
 		a.tools.RestoreSnapshot(saved.Snapshot)
 		a.messages = append([]llm.Message(nil), saved.Messages...)
+		a.sanitizeMessages()
 		// Buffer IDs are process-local; restore exposes a fresh bounded state and
 		// explicitly requires re-reading prior tool references.
 		a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: "会话已恢复。旧工具 buffer 已过期；不要沿用旧 buffer_id。需要时重新调用原工具、read_handoff 或 review_state。"})
@@ -242,7 +312,19 @@ func (t *Team) LoadSession(path string) error {
 		}
 		w := &teamWorker{agent: a, saved: saved}
 		a.checkpoint = func(a *Agent) { t.capture(w, a) }
+		t.bindIRC(w)
 		t.workers = append(t.workers, w)
+		if saved.Status.Phase == phaseModerator {
+			a.nameClient = nil
+			a.assignment = ""
+			a.completed = false
+			a.moderateTool = t.moderatorTool
+			w.saved.Completed = false
+			w.saved.Status.Status = "idle"
+			w.saved.Status.Activity = "已恢复，等待 go"
+			t.moderator = w
+			t.workers = t.workers[:len(t.workers)-1]
+		}
 		t.board.Register(a.id, a.phase)
 		t.board.SetStatus(a.id, saved.Status.Status)
 	}

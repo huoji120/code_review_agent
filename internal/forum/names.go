@@ -42,7 +42,7 @@ func (b *Board) RegisterName(id, name string) error {
 		}
 		return fmt.Errorf("name already registered as %q; renaming is not allowed", a.Name)
 	}
-	for _, reserved := range []string{"user", "system", "coordinator"} {
+	for _, reserved := range []string{"user", "system", "coordinator", "moderator", "论坛管理员"} {
 		if strings.EqualFold(name, reserved) {
 			return fmt.Errorf("name is reserved; choose another name")
 		}
@@ -78,7 +78,11 @@ func (b *Board) RestoreNames(names map[string]string) error {
 		_, exists := b.agents[id]
 		b.mu.Unlock()
 		if !exists {
-			b.Register(id, "audit") // Historical verifier; stable ID remains reserved.
+			stage := "audit" // Historical verifier; stable ID remains reserved.
+			if id == "moderator" {
+				stage = "moderator"
+			}
+			b.Register(id, stage)
 			b.SetStatus(id, "completed")
 		}
 	}

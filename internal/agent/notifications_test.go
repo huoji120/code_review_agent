@@ -13,7 +13,8 @@ import (
 )
 
 type noticeClient struct {
-	call func(context.Context, []llm.Message) (string, error)
+	call  func(context.Context, []llm.Message) (string, error)
+	tools func(context.Context, []llm.Message) (llm.ToolResponse, error)
 }
 
 func (c *noticeClient) Chat(ctx context.Context, messages []llm.Message) (string, error) {
@@ -25,6 +26,22 @@ func (c *noticeClient) ChatStream(ctx context.Context, messages []llm.Message, e
 		return err
 	}
 	return emit(llm.Delta{Content: text})
+}
+
+func (c *noticeClient) ChatTools(ctx context.Context, messages []llm.Message, _ []llm.ToolDefinition, emit func(llm.Delta) error) (llm.ToolResponse, error) {
+	if c.tools == nil {
+		return llm.ToolResponse{}, fmt.Errorf("native fixture callback missing")
+	}
+	response, err := c.tools(ctx, messages)
+	if err != nil {
+		return llm.ToolResponse{}, err
+	}
+	if emit != nil {
+		if err := emit(llm.Delta{Content: response.Content, Thinking: response.Thinking}); err != nil {
+			return llm.ToolResponse{}, err
+		}
+	}
+	return response, nil
 }
 
 func noticeMessages(messages []llm.Message) []string {
@@ -45,7 +62,7 @@ func TestAutomaticNoticeDuringNormalFileToolsPreservesBuffer(t *testing.T) {
 	a.cfg.Agent.MaxTurns = 3
 	step := 0
 	var bufferID string
-	client.call = func(ctx context.Context, messages []llm.Message) (string, error) {
+	client.tools = func(ctx context.Context, messages []llm.Message) (llm.ToolResponse, error) {
 		step++
 		switch step {
 		case 1:
@@ -59,11 +76,11 @@ func TestAutomaticNoticeDuringNormalFileToolsPreservesBuffer(t *testing.T) {
 				t.Fatal("next read-file turn did not receive bounded notice")
 			}
 			for _, m := range messages {
-				if strings.HasPrefix(m.Content, "Tool result for read_file:\n") {
+				if m.Type == "function_call_output" {
 					var result struct {
 						BufferID string `json:"buffer_id"`
 					}
-					if err := json.Unmarshal([]byte(strings.TrimPrefix(m.Content, "Tool result for read_file:\n")), &result); err != nil {
+					if err := json.Unmarshal([]byte(m.Content), &result); err != nil {
 						t.Fatal(err)
 					}
 					bufferID = result.BufferID
@@ -78,12 +95,12 @@ func TestAutomaticNoticeDuringNormalFileToolsPreservesBuffer(t *testing.T) {
 				t.Fatal("quiet turn duplicated notice")
 			}
 			last := messages[len(messages)-1].Content
-			if !strings.HasPrefix(last, "Tool result for read_tool_buffer:\n") || !strings.Contains(last, `"ok":true`) {
+			if messages[len(messages)-1].Type != "function_call_output" || !strings.Contains(last, `"ok":true`) {
 				t.Fatalf("notice invalidated buffer: %s", last)
 			}
 			return toolReply("read_tool_buffer", map[string]any{"buffer_id": bufferID, "offset": 0, "limit": 64}), nil
 		}
-		return "", fmt.Errorf("unexpected model request")
+		return llm.ToolResponse{}, fmt.Errorf("unexpected model request")
 	}
 	a.Run(context.Background(), "inspect", func(Event) {})
 	if step != 3 || bufferID == "" {
@@ -105,12 +122,12 @@ func TestNotificationCancellationCheckpointRestoreAndCompactionRetry(t *testing.
 	}
 	a.sanitizeMessages()
 	ctx, cancel := context.WithCancel(context.Background())
-	client.call = func(ctx context.Context, messages []llm.Message) (string, error) {
+	client.tools = func(ctx context.Context, messages []llm.Message) (llm.ToolResponse, error) {
 		if len(noticeMessages(messages)) != 1 {
 			t.Fatal("request lacked notice")
 		}
 		cancel()
-		return "", ctx.Err()
+		return llm.ToolResponse{}, ctx.Err()
 	}
 	if _, err := a.chatStream(ctx, func(Event) {}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected cancellation: %v", err)
@@ -142,16 +159,16 @@ func TestNotificationCancellationCheckpointRestoreAndCompactionRetry(t *testing.
 	a.cfg.Agent.RetryAttempts = 1
 	a.compressClient = &noticeClient{call: func(context.Context, []llm.Message) (string, error) { return "bounded context summary", nil }}
 	calls := 0
-	retry.call = func(ctx context.Context, messages []llm.Message) (string, error) {
+	retry.tools = func(ctx context.Context, messages []llm.Message) (llm.ToolResponse, error) {
 		calls++
 		got := noticeMessages(messages)
 		if len(got) != 1 || got[0] != original {
 			t.Fatal("restore/compaction omitted or duplicated pending notice")
 		}
 		if calls == 1 {
-			return "", errors.New("context length exceeded")
+			return llm.ToolResponse{}, errors.New("context length exceeded")
 		}
-		return "continue", nil
+		return toolReply("read_handoff", map[string]any{}), nil
 	}
 	if _, err := a.chatStream(context.Background(), func(Event) {}); err != nil {
 		t.Fatal(err)
@@ -175,7 +192,7 @@ func TestActiveVerifierReceivesStreamingNoticeWithoutName(t *testing.T) {
 	defer child.tools.Close()
 	child.cfg.OpenAI.Stream = true
 	step := 0
-	client.call = func(ctx context.Context, messages []llm.Message) (string, error) {
+	client.tools = func(ctx context.Context, messages []llm.Message) (llm.ToolResponse, error) {
 		step++
 		switch step {
 		case 1:
@@ -183,17 +200,24 @@ func TestActiveVerifierReceivesStreamingNoticeWithoutName(t *testing.T) {
 				t.Fatal(err)
 			}
 			return toolReply("read_file", map[string]any{"path": "entry1.go", "limit": 1}), nil
-		case 2:
+		default:
 			got := noticeMessages(messages)
 			if len(got) != 1 || !strings.Contains(got[0], "verifier update") {
 				t.Fatal("active verifier missed notice")
 			}
-			return "verified conclusion", nil
+			return toolReply("read_file", map[string]any{"path": "entry1.go", "limit": 1}), nil
 		}
-		return "", fmt.Errorf("unexpected verifier turn")
+	}
+	client.call = func(_ context.Context, messages []llm.Message) (string, error) {
+		for _, message := range messages {
+			if message.Type != "" {
+				t.Fatal("final text-only verification request retained native items")
+			}
+		}
+		return "verified conclusion", nil
 	}
 	conclusion, err := child.runVerification(context.Background(), func(Event) {}, verifyFindingArgs{Title: "candidate"})
-	if err != nil || conclusion != "verified conclusion" || child.forumPending != "" || step != 2 {
+	if err != nil || conclusion != "verified conclusion" || child.forumPending != "" || step != child.verificationTurnLimit() {
 		t.Fatalf("verifier did not finish cleanly: %q %v", conclusion, err)
 	}
 }

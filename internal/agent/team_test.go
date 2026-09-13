@@ -35,29 +35,35 @@ var workerIdentity = regexp.MustCompile(`([a-z]+-[0-9]+)，阶段是 ([a-z]+)`)
 func newStagedClient(recon, audit int) *stagedClient {
 	return &stagedClient{steps: map[string]int{}, arrivals: map[string]int{}, gates: map[string]chan struct{}{"recon": make(chan struct{}), "audit": make(chan struct{})}, counts: map[string]int{"recon": recon, "audit": audit}, started: make(chan struct{}, 32)}
 }
-func toolReply(name string, args any) string {
-	data, _ := json.Marshal(map[string]any{"name": name, "arguments": args})
-	return "<tool_call>" + string(data) + "</tool_call>"
+
+var fixtureCallID atomic.Uint64
+
+func toolReply(name string, args any) llm.ToolResponse {
+	data, _ := json.Marshal(args)
+	return llm.ToolResponse{Calls: []llm.FunctionCall{{CallID: fmt.Sprintf("fixture-%d", fixtureCallID.Add(1)), Name: name, Arguments: string(data)}}}
 }
-func (c *stagedClient) Chat(ctx context.Context, messages []llm.Message) (string, error) {
+func (c *stagedClient) Chat(context.Context, []llm.Message) (string, error) {
+	return "", fmt.Errorf("staged tool fixture must use native calls")
+}
+func (c *stagedClient) ChatTools(ctx context.Context, messages []llm.Message, _ []llm.ToolDefinition, _ func(llm.Delta) error) (llm.ToolResponse, error) {
 	if c.blocked.Load() {
 		c.started <- struct{}{}
 		<-ctx.Done()
-		return "", ctx.Err()
+		return llm.ToolResponse{}, ctx.Err()
 	}
 	identity := workerIdentity.FindStringSubmatch(messages[0].Content)
 	if len(identity) != 3 {
-		return "", fmt.Errorf("missing worker identity")
+		return llm.ToolResponse{}, fmt.Errorf("missing worker identity")
 	}
 	id, stage := identity[1], identity[2]
 	for _, m := range messages {
 		if stage == phaseAudit && strings.Contains(m.Content, "PRIVATE_ONLY_recon-") {
-			return "", fmt.Errorf("raw recon history leaked into audit")
+			return llm.ToolResponse{}, fmt.Errorf("raw recon history leaked into audit")
 		}
-		if strings.HasPrefix(m.Content, "Tool result for ") {
-			_, data, ok := strings.Cut(m.Content, "\n")
-			if !ok || len(data) > 1024 || !json.Valid([]byte(data)) {
-				return "", fmt.Errorf("unbounded/invalid tool output for %s: %d", id, len(data))
+		if m.Type == "function_call_output" {
+			data := m.Content
+			if len(data) > 1024 || !json.Valid([]byte(data)) {
+				return llm.ToolResponse{}, fmt.Errorf("unbounded/invalid tool output for %s: %d", id, len(data))
 			}
 		}
 	}
@@ -75,18 +81,18 @@ func (c *stagedClient) Chat(ctx context.Context, messages []llm.Message) (string
 	if step == 0 {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return llm.ToolResponse{}, ctx.Err()
 		case <-gate:
 		}
 	}
 	var index int
 	fmt.Sscanf(id, stage+"-%d", &index)
 	path := fmt.Sprintf("entry%d.go", index)
-	bufferCall := func() (string, error) {
+	bufferCall := func() (llm.ToolResponse, error) {
 		var raw string
 		for i := len(messages) - 1; i >= 0; i-- {
-			if strings.HasPrefix(messages[i].Content, "Tool result for ") {
-				_, raw, _ = strings.Cut(messages[i].Content, "\n")
+			if messages[i].Type == "function_call_output" {
+				raw = messages[i].Content
 				break
 			}
 		}
@@ -96,7 +102,7 @@ func (c *stagedClient) Chat(ctx context.Context, messages []llm.Message) (string
 		}
 		json.Unmarshal([]byte(raw), &p)
 		if p.BufferID == "" {
-			return "", fmt.Errorf("large result not buffered")
+			return llm.ToolResponse{}, fmt.Errorf("large result not buffered")
 		}
 		return toolReply("read_tool_buffer", map[string]any{"buffer_id": p.BufferID, "offset": p.NextOffset, "limit": 128}), nil
 	}
@@ -107,13 +113,18 @@ func (c *stagedClient) Chat(ctx context.Context, messages []llm.Message) (string
 		case 1:
 			return bufferCall()
 		case 2:
-			return "PRIVATE_ONLY_" + id + "\n" + toolReply("project_note_update", map[string]any{"note": "NOTE_" + id + strings.Repeat("结构化侦察证据", 400)}), nil
+			response := toolReply("project_note_update", map[string]any{"note": "NOTE_" + id + strings.Repeat("结构化侦察证据", 400)})
+			response.Content = "PRIVATE_ONLY_" + id
+			return response, nil
 		case 3:
 			return toolReply("forum_post", map[string]any{"topic": "侦察交接", "content": "已定位入口 " + path}), nil
 		case 4:
 			return toolReply("audit_plan_done", map[string]any{"summary": "入口侦察完成", "audit_map": "MAP_" + id, "audit_files": []string{path}, "execute_instructions": "独立复核入口"}), nil
 		}
 	} else {
+		if step >= 7 {
+			return toolReply("end_audit", map[string]any{"summary": "分配入口复核完成", "vote": "approve"}), nil
+		}
 		switch step {
 		case 0:
 			return toolReply("read_handoff", map[string]any{}), nil
@@ -129,11 +140,9 @@ func (c *stagedClient) Chat(ctx context.Context, messages []llm.Message) (string
 			return toolReply("forum_post", map[string]any{"topic": "审计交流", "content": "已独立复核 " + path}), nil
 		case 6:
 			return toolReply("report_finding", map[string]any{"title": "测试入口风险", "path": path, "severity": "high", "evidence": "fixture evidence", "impact": "fixture impact"}), nil
-		case 7:
-			return toolReply("end_audit", map[string]any{"summary": "分配入口复核完成"}), nil
 		}
 	}
-	return "", fmt.Errorf("unexpected extra step %s:%d", id, step)
+	return llm.ToolResponse{}, fmt.Errorf("unexpected extra step %s:%d", id, step)
 }
 func (c *stagedClient) ChatStream(ctx context.Context, messages []llm.Message, emit func(llm.Delta) error) error {
 	s, err := c.Chat(ctx, messages)
@@ -152,6 +161,8 @@ func newTestTeam(t *testing.T, client llm.Client) *Team {
 		}
 	}
 	cfg := config.Config{Workspace: workspace, OpenAI: config.OpenAIConfig{MaxContextTokens: 64000, MaxOutputTokens: 1000}, Agent: config.AgentConfig{ReconAgents: 4, AuditAgents: 4, ForumWaitSeconds: 1, MaxTurns: 20, RetryAttempts: -1, MaxToolResultChars: 1024, CompressAtRatio: .8, CompressBufferTokens: 1000}}
+	disabledModerator := false
+	cfg.Agent.ModeratorEnabled = &disabledModerator
 	cfg.CompressOpenAI = cfg.OpenAI
 	p := prompt.Prompts{System: "audit", PlanSystem: "recon", Templates: map[string]string{"initial_plan_instruction": "!{input}\n!{review_state}", "initial_audit_instruction": "!{input}\n!{review_state}", "end_audit_confirmation": "请完成剩余文件"}}
 	r, err := tools.NewRegistry(workspace, 1024)
@@ -164,6 +175,31 @@ func newTestTeam(t *testing.T, client llm.Client) *Team {
 	}}
 	t.Cleanup(func() { team.Close() })
 	return team
+}
+
+func TestStageAssignmentsAreSelfOrganized(t *testing.T) {
+	team := newTestTeam(t, nil)
+	for _, assignment := range []string{
+		stageAssignment(phaseRecon, 4),
+		stageAssignment(phaseAudit, 4),
+	} {
+		if !strings.Contains(assignment, "系统不预设角色、主题或文件范围") {
+			t.Fatalf("assignment does not require self-division: %q", assignment)
+		}
+		for _, forbidden := range []string{"重点：", "首要负责文件", "已将你的", "架构、入口", "认证、授权", "危险 sink"} {
+			if strings.Contains(assignment, forbidden) {
+				t.Fatalf("preset scope leaked into assignment %q: %q", forbidden, assignment)
+			}
+		}
+	}
+	team.mu.Lock()
+	team.createStageLocked(phaseAudit)
+	team.mu.Unlock()
+	for _, worker := range team.workers {
+		if files := worker.agent.tools.Snapshot().Files; len(files) != 0 {
+			t.Fatalf("audit worker received preassigned files: %+v", files)
+		}
+	}
 }
 
 func TestReceiveUsesStatusOnlyForTurnsAndTools(t *testing.T) {
@@ -234,6 +270,11 @@ func TestTeamStagesIsolationHandoffAndSession(t *testing.T) {
 	}
 	if len(restored.ForumMessages()) != len(team.ForumMessages()) {
 		t.Fatal("forum lost on restore")
+	}
+	for _, worker := range restored.workers {
+		if strings.Contains(worker.agent.assignment, "重点：") || strings.Contains(worker.agent.assignment, "首要负责文件") {
+			t.Fatalf("restored worker retained preset scope: %q", worker.agent.assignment)
+		}
 	}
 }
 

@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"code-review-agent/internal/forum"
+	"code-review-agent/internal/llm"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 )
@@ -142,13 +144,37 @@ func (m Model) summary() string {
 	return fmt.Sprintf("覆盖 %d/%d · Todo %d/%d · 漏洞 %d", reviewed, len(m.snapshot.Files), done, len(m.snapshot.Todos), len(m.snapshot.Findings))
 }
 
+func generationLabel(progress *llm.GenerationProgress) string {
+	if progress == nil {
+		return ""
+	}
+	if progress.Estimated {
+		return fmt.Sprintf("generation≈%d tok", progress.OutputTokens)
+	}
+	return fmt.Sprintf("generation %d tok", progress.OutputTokens)
+}
+
+func activityClock(value string) string {
+	if stamp, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return stamp.Local().Format("15:04:05")
+	}
+	return value
+}
+
 // Pin current team progress above the scrollable operations area. Excess workers
 // remain accessible in that area's scrollback on small screens or large teams.
 func (m Model) leftContent(width, height int) (pinned, lines []string) {
 	pinned = append(pinned, fitLine(m.summary(), width))
 	maxPinned := max(1, (height-5)/2)
 	for i, w := range m.workers {
-		row := fmt.Sprintf("%s [%s] #%d %s", m.agentLabel(w.ID, w.Name), statusLabel(w.Status), w.Turn, boundedText(w.Activity, 220))
+		activity := w.Activity
+		generation := generationLabel(w.Generation)
+		if w.Generation != nil && w.Generation.ReceivedAt == "" {
+			activity = "等待首段输出 · " + activity
+		} else if w.LastModelActivity != "" {
+			activity += " · 输出 " + activityClock(w.LastModelActivity)
+		}
+		row := fmt.Sprintf("%s %s [%s] #%d %s", m.agentLabel(w.ID, w.Name), generation, statusLabel(w.Status), w.Turn, boundedText(activity, 220))
 		if i < maxPinned {
 			pinned = append(pinned, fitLine(row, width))
 		} else {
@@ -384,19 +410,22 @@ func (m *Model) toggleForumPost(id int64) {
 			continue
 		}
 		m.selectedPost = id
-		if m.expandedPosts == nil {
-			m.expandedPosts = make(map[int64]bool)
-		}
-		if m.expandedPosts[id] {
-			delete(m.expandedPosts, id)
-		} else {
-			m.expandedPosts[id] = true
-		}
-		m.forumRevision++
-		m.revealSelectedPost()
+		m.showForumPost(post)
 		return
 	}
 	m.addEvent("所选帖子已移出当前页；↑↓ 重新选择，或 /thread <ID> 打开。")
+}
+
+func (m *Model) showForumPost(post forum.Post) {
+	topic := post.Root.Topic
+	if topic == "" {
+		topic = "讨论"
+	}
+	lines := []string{fmt.Sprintf("作者：%s · 阶段：%s · 帖子 ID：%d", m.agentLabel(post.Root.AgentID, post.Root.AgentName), post.Root.Stage, post.ID), "", post.Root.Content}
+	for _, reply := range post.Replies {
+		lines = append(lines, "", fmt.Sprintf("回复 #%d · %s", reply.ID, m.agentLabel(reply.AgentID, reply.AgentName)), reply.Content)
+	}
+	m.showDetail(fmt.Sprintf("论坛帖子 #%d · %s", post.ID, topic), lines)
 }
 
 func (m *Model) revealSelectedPost() {

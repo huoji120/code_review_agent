@@ -22,16 +22,20 @@ const (
 )
 
 type Message struct {
-	ID        int64     `json:"id"`
-	ThreadID  int64     `json:"thread_id"`
-	AgentID   string    `json:"agent_id"`
-	AgentName string    `json:"agent_name,omitempty"`
-	Stage     string    `json:"stage"`
-	To        string    `json:"to"`
-	ReplyTo   int64     `json:"reply_to"`
-	Topic     string    `json:"topic"`
-	Content   string    `json:"content"`
-	CreatedAt time.Time `json:"created_at"`
+	ID               int64     `json:"id"`
+	ThreadID         int64     `json:"thread_id"`
+	AgentID          string    `json:"agent_id"`
+	AgentName        string    `json:"agent_name,omitempty"`
+	Stage            string    `json:"stage"`
+	To               string    `json:"to"`
+	ReplyTo          int64     `json:"reply_to"`
+	Topic            string    `json:"topic"`
+	Content          string    `json:"content"`
+	CreatedAt        time.Time `json:"created_at"`
+	Closed           bool      `json:"closed,omitempty"`
+	Pinned           bool      `json:"pinned,omitempty"`
+	Announcement     bool      `json:"announcement,omitempty"`
+	ModerationReason string    `json:"moderation_reason,omitempty"`
 }
 
 type participant struct {
@@ -42,16 +46,31 @@ type participant struct {
 }
 
 type Board struct {
-	mu           sync.Mutex
-	defaultWait  time.Duration
-	nextID       int64
-	msgs         []Message
-	bytes        int
-	agents       map[string]participant
-	participants map[int64]map[string]int64
-	threadCounts map[int64]int
-	notify       chan struct{}
-	hook         func(Message)
+	mu               sync.Mutex
+	defaultWait      time.Duration
+	nextID           int64
+	msgs             []Message
+	bytes            int
+	agents           map[string]participant
+	participants     map[int64]map[string]int64
+	threadCounts     map[int64]int
+	notify           chan struct{}
+	hook             func(Message)
+	consensus        map[string]*closeRequest
+	consensusMembers map[string]map[string]bool
+	onConsensus      func(string)
+	nextConsensusID  uint64
+}
+
+type closeRequest struct {
+	ID        uint64
+	Stage     string
+	Summary   string
+	NextSteps string
+	Deadline  time.Time
+	Members   map[string]bool
+	Votes     map[string]bool
+	Status    string
 }
 
 func New(defaultWait time.Duration) *Board {
@@ -61,7 +80,15 @@ func New(defaultWait time.Duration) *Board {
 	if defaultWait > maxWait {
 		defaultWait = maxWait
 	}
-	return &Board{defaultWait: defaultWait, agents: make(map[string]participant), participants: make(map[int64]map[string]int64), threadCounts: make(map[int64]int), notify: make(chan struct{})}
+	return &Board{
+		defaultWait:      defaultWait,
+		agents:           make(map[string]participant),
+		participants:     make(map[int64]map[string]int64),
+		threadCounts:     make(map[int64]int),
+		notify:           make(chan struct{}),
+		consensus:        make(map[string]*closeRequest),
+		consensusMembers: make(map[string]map[string]bool),
+	}
 }
 func (b *Board) Register(id, stage string) {
 	b.mu.Lock()
@@ -72,7 +99,11 @@ func (b *Board) Register(id, stage string) {
 	if _, exists := b.agents[id]; exists {
 		return
 	}
-	b.agents[id] = participant{ID: id, Stage: stage, Status: "running"}
+	a := participant{ID: id, Stage: stage, Status: "running"}
+	if id == "moderator" && stage == "moderator" {
+		a.Name = "论坛管理员"
+	}
+	b.agents[id] = a
 	b.signalLocked()
 }
 func (b *Board) SetStatus(id, status string) {
@@ -88,24 +119,22 @@ func (b *Board) SetOnPost(fn func(Message)) { b.mu.Lock(); b.hook = fn; b.mu.Unl
 func (b *Board) signalLocked()              { close(b.notify); b.notify = make(chan struct{}) }
 func IsTool(name string) bool {
 	switch name {
-	case "forum_post", "forum_threads", "forum_read", "forum_wait", "forum_roster":
+	case "forum_post", "forum_threads", "forum_read", "forum_wait", "forum_roster", "forum_moderate", "forum_announce":
 		return true
 	}
 	return false
 }
 func ToolPrompt() string {
-	return `# 交流论坛工具
-- forum_post {to,reply_to,topic,content}：发帖/回复。to 为空或 "*" 表示广播，或填 forum_roster 中的 Agent ID；reply_to 可选，为已有帖子 ID。content 必填、最多16KiB；topic 最多512字节。返回 message.id，可作为等待该帖后续回复的 after_id。发送者由服务端确定，禁止传 agent_id 伪造身份。
-- forum_threads {page,limit,query}：按最新活动倒序的编号分页帖子列表。page 默认1；limit 默认60、最大64。query 可选，对原标题/正文及所有回复标题/正文进行忽略大小写的字面子串搜索。返回原文摘录、page、total_pages、has_more、gap；用 forum_read 的 thread_id 打开帖子，用 forum_post 的 reply_to 回复。自动通知只推送其他作者的新帖，以及你发帖/回复参与过的线程的新回复；to 不影响自动通知参与规则。
-- forum_read {after_id,limit,all,thread_id,from}：按ID升序发现帖子，仅返回每条正文的有界原文摘录（最多512字节）。after_id 默认0；limit 默认16、最大64；整个 JSON 页最多4096字节，可能少于指定条数。顶层 next_id / has_more 是消息列表游标；消息内 total_bytes / next_offset / has_more 是该条正文的字节进度，不要混用。默认只读自己发出的、发给自己的和广播消息；all:true 可读整个公开论坛。thread_id 只读该线程及递归回复，from 限制发帖人；gap 表示早期帖子已淘汰，不是完整历史。
-- forum_read {message_id,offset,max_bytes,all,thread_id,from}：按固定消息 ID 分页读取需要的长正文。offset 是 UTF-8 字节位置，默认0，必须位于字符边界；max_bytes 默认1024、最大4096，实际内容可能为满足 JSON 字节上限而更短。返回 message 中该页原文，以及顶层 offset / next_offset / has_more / total_bytes。只对相关正文沿同一 message_id 的 next_offset 继续读取，不要因为无关内容很长就读完整个 buffer。过滤规则不变；已淘汰或不可见的消息明确失败。不要把消息 next_id 用作正文 offset，也不要把正文偏移套到另一条消息。
-- forum_wait {after_id,limit,all,thread_id,from,timeout_seconds}：与消息发现模式相同，只返回正文摘录；已有匹配立即返回，否则事件唤醒等待。timeout_seconds 默认配置值、最大120秒；返回 timed_out、cancelled、peers_done 和 roster，roster_has_more 表示名册因页上限被截短（完整名册按需 forum_roster）。先发问，再把该帖id用作after_id等待回复；超时或对方已完成时独立推进，不要无限等待。正文分页使用 forum_read 的 message_id 模式。
-- forum_roster {}：查看 Agent ID、阶段和 running/waiting/completed/failed/cancelled/pending 状态。
-论坛是公开交流而非私信；to 只影响默认收件过滤。保留最近4096条且最多8MiB，完整源码请用文件工具而不是粘贴到论坛。`
+	return `# 交流论坛协作
+论坛操作仅使用本轮提供的原生工具，参数以原生定义为准。所有帖子公开可读；指定接收者不是私信。正文提及 @全体成员、@全体 或 @all 可提醒全体其他成员，单纯阅读或指定接收者不会订阅线程。新帖与回复应包含实际证据或具体问题，不使用占位正文。
+
+forum_threads 用于发现帖子，forum_read 的消息游标模式用于发现回复；它们返回的 excerpt/content 前缀不是完整正文。要核对完整证据，使用 forum_read 的指定消息正文分页，按返回的 next_offset 逐页读取至 has_more=false。正文的 has_more 与外层剩余消息的 has_more 不同，不可混淆。保留历史缺口、过期消息和关闭线程状态必须如实对待。
+
+管理员可管理线程并发布公告，但建议不替代证据，不代其他成员回答，也不计入阶段共识票。关闭线程保留历史，禁止任何人继续回复；有新证据可另发帖。关闭请求 pending 尚未获准，rejected/timed_out 表示本轮拒绝或超时；继续帮助复核、检查尚未覆盖或分工之外的代码、收集证据，不要反复等待或刷关闭投票。`
 }
 
 func messageBytes(m Message) int {
-	return len(m.Content) + len(m.Topic) + len(m.AgentID) + len(m.AgentName) + len(m.Stage) + len(m.To) + 128
+	return len(m.Content) + len(m.Topic) + len(m.AgentID) + len(m.AgentName) + len(m.Stage) + len(m.To) + len(m.ModerationReason) + 128
 }
 func (b *Board) trimLocked() {
 	for len(b.msgs) > maxMessages || b.bytes > maxRetainedBytes {
@@ -125,6 +154,10 @@ func (b *Board) hasIDLocked(id int64) bool {
 	return i < len(b.msgs) && b.msgs[i].ID == id
 }
 func (b *Board) Post(agentID, stage, to string, replyTo int64, topic, content string) (Message, error) {
+	return b.post(agentID, stage, to, replyTo, topic, content, false, false)
+}
+
+func (b *Board) post(agentID, stage, to string, replyTo int64, topic, content string, announcement, pinned bool) (Message, error) {
 	if strings.TrimSpace(content) == "" || len(content) > maxContent {
 		return Message{}, fmt.Errorf("content 必须非空且不超过 %d 字节", maxContent)
 	}
@@ -147,13 +180,22 @@ func (b *Board) Post(agentID, stage, to string, replyTo int64, topic, content st
 		b.mu.Unlock()
 		return Message{}, fmt.Errorf("回复目标不存在或已淘汰")
 	}
-	b.nextID++
-	threadID := b.nextID
+	threadID := b.nextID + 1
+	var parent Message
 	if replyTo > 0 {
 		index := sort.Search(len(b.msgs), func(i int) bool { return b.msgs[i].ID >= replyTo })
-		threadID = b.msgs[index].ThreadID
+		parent = b.msgs[index]
+		if parent.Closed {
+			b.mu.Unlock()
+			return Message{}, fmt.Errorf("线程已关闭，禁止回复；请阅读历史或另发有新证据的帖子")
+		}
+		threadID = parent.ThreadID
 	}
-	m := Message{ID: b.nextID, ThreadID: threadID, AgentID: agentID, AgentName: a.Name, Stage: a.Stage, To: to, ReplyTo: replyTo, Topic: topic, Content: content, CreatedAt: time.Now().UTC()}
+	b.nextID++
+	m := Message{ID: b.nextID, ThreadID: threadID, AgentID: agentID, AgentName: a.Name, Stage: a.Stage, To: to, ReplyTo: replyTo, Topic: topic, Content: content, CreatedAt: time.Now().UTC(), Announcement: announcement, Pinned: pinned}
+	if replyTo > 0 {
+		copyModeration(&m, parent)
+	}
 	b.msgs = append(b.msgs, m)
 	b.joinThreadLocked(m)
 	b.threadCounts[m.ThreadID]++
@@ -174,15 +216,9 @@ func (b *Board) Messages() []Message {
 	return append([]Message(nil), b.msgs...)
 }
 func (b *Board) Restore(messages []Message) error {
-	var previous int64
-	for _, m := range messages {
-		if m.ID <= previous || m.AgentID == "" || m.Stage == "" || strings.TrimSpace(m.Content) == "" || len(m.Content) > maxContent || len(m.Topic) > maxTopic || m.ReplyTo < 0 || m.ReplyTo >= m.ID || m.ThreadID < 0 || m.ThreadID > m.ID {
-			return fmt.Errorf("无效的论坛会话记录")
-		}
-		if m.AgentName != "" && !validName(m.AgentName) {
-			return fmt.Errorf("无效的论坛作者名字")
-		}
-		previous = m.ID
+	normalized, previous, err := validateRestoredMessages(messages)
+	if err != nil {
+		return err
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -190,18 +226,7 @@ func (b *Board) Restore(messages []Message) error {
 	b.bytes = 0
 	b.participants = make(map[int64]map[string]int64)
 	b.threadCounts = make(map[int64]int)
-	threadIDs := make(map[int64]int64)
-	for _, m := range messages {
-		if m.ThreadID == 0 {
-			m.ThreadID = m.ID
-			if m.ReplyTo > 0 {
-				m.ThreadID = threadIDs[m.ReplyTo]
-				if m.ThreadID == 0 {
-					m.ThreadID = m.ReplyTo
-				}
-			}
-		}
-		threadIDs[m.ID] = m.ThreadID
+	for _, m := range normalized {
 		b.msgs = append(b.msgs, m)
 		b.joinThreadLocked(m)
 		b.threadCounts[m.ThreadID]++
@@ -403,6 +428,12 @@ func (b *Board) Call(ctx context.Context, id, stage, name string, raw json.RawMe
 	b.mu.Unlock()
 	if !known || a.Stage != stage {
 		return failure("未注册的 Agent 或阶段不匹配")
+	}
+	if name == "forum_moderate" || name == "forum_announce" {
+		if id != "moderator" || stage != "moderator" {
+			return failure("仅论坛管理员可以管理线程或发布公告")
+		}
+		return b.moderatorCall(id, stage, name, raw)
 	}
 	if name == "forum_threads" {
 		return b.threadPage(raw)

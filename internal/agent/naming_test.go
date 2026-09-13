@@ -43,7 +43,7 @@ func TestNamingRunsBesideToolsAndAnnouncesOnceAcrossRestore(t *testing.T) {
 	initialPrompt := a.collaborationPrompt()
 	var before []llm.Message
 	step := 0
-	client.call = func(ctx context.Context, messages []llm.Message) (string, error) {
+	client.tools = func(ctx context.Context, messages []llm.Message) (llm.ToolResponse, error) {
 		step++
 		switch step {
 		case 1:
@@ -51,8 +51,8 @@ func TestNamingRunsBesideToolsAndAnnouncesOnceAcrossRestore(t *testing.T) {
 			return toolReply("read_file", map[string]any{"path": "entry1.go", "limit": 1}), nil
 		case 2:
 			last := messages[len(messages)-1].Content
-			assertNamedWorkerFileRead(t, strings.TrimPrefix(last, "Tool result for read_file:\n"))
-			if !strings.HasPrefix(last, "Tool result for read_file:\n") || a.board.Name(a.id) != "" {
+			assertNamedWorkerFileRead(t, last)
+			if messages[len(messages)-1].Type != "function_call_output" || a.board.Name(a.id) != "" {
 				t.Fatal("file tool waited for naming or failed")
 			}
 			return toolReply("forum_post", map[string]any{"topic": "scope", "content": "unaltered evidence"}), nil
@@ -78,7 +78,7 @@ func TestNamingRunsBesideToolsAndAnnouncesOnceAcrossRestore(t *testing.T) {
 			}
 			return toolReply("forum_roster", map[string]any{}), nil
 		}
-		return "", errors.New("unexpected audit turn")
+		return llm.ToolResponse{}, errors.New("unexpected audit turn")
 	}
 	a.Run(context.Background(), "inspect", func(e Event) {
 		if e.Kind == "name" {

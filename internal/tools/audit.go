@@ -1,9 +1,13 @@
 package tools
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 type Finding struct {
 	ID             int    `json:"id"`
+	Key            string `json:"finding_key,omitempty"`
 	Severity       string `json:"severity"`
 	Title          string `json:"title"`
 	Path           string `json:"path"`
@@ -28,6 +32,7 @@ type reportFindingArgs struct {
 type endAuditArgs struct {
 	Summary   string `json:"summary"`
 	NextSteps string `json:"next_steps"`
+	Vote      string `json:"vote"`
 }
 
 type auditSummary struct {
@@ -72,6 +77,9 @@ func (r *Registry) endAudit(raw json.RawMessage) Result {
 	args, err := decodeArgs[endAuditArgs](raw)
 	if err != nil {
 		return Result{OK: false, Error: err.Error()}
+	}
+	if strings.ToLower(strings.TrimSpace(args.Vote)) != "approve" {
+		return Result{OK: false, Error: "end_audit requires an explicit team approve vote"}
 	}
 	if args.Summary == "" {
 		args.Summary = "Audit completed."
