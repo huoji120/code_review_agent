@@ -186,6 +186,7 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, emit 
 			if delta.Content == "" && delta.Thinking == "" {
 				continue
 			}
+			streamOutputActivity(ctx)
 			if err := emit(delta); err != nil {
 				return err
 			}
@@ -208,10 +209,11 @@ func NewOpenAIClient(cfg config.OpenAIConfig) *OpenAIClient {
 }
 
 // Streaming requests share the transport, but not the client's whole-request
-// deadline. The watchdog bounds header wait, then each period without body bytes.
+// deadline. The watchdog bounds header wait, then time without model output.
 func (c *OpenAIClient) doStream(req *http.Request) (*http.Response, context.Context, error) {
 	ctx, cancel := context.WithCancelCause(req.Context())
 	idle := &streamIdle{ctx: ctx, cancel: cancel, timeout: c.httpClient.Timeout}
+	ctx = context.WithValue(ctx, streamIdleKey{}, idle)
 	if idle.timeout > 0 {
 		idle.deadline = time.Now().Add(idle.timeout)
 		idle.timer = time.AfterFunc(idle.timeout, idle.expire)
@@ -226,16 +228,23 @@ func (c *OpenAIClient) doStream(req *http.Request) (*http.Response, context.Cont
 		idle.close()
 		return nil, ctx, err
 	}
+	idle.mu.Lock()
+	idle.generating = resp.StatusCode >= 200 && resp.StatusCode < 300
+	idle.mu.Unlock()
 	idle.activity()
 	resp.Body = &streamBody{ReadCloser: resp.Body, idle: idle}
 	return resp, ctx, nil
 }
 
 type streamTimeoutError struct {
-	timeout time.Duration
+	timeout    time.Duration
+	generating bool
 }
 
 func (e *streamTimeoutError) Error() string {
+	if e.generating {
+		return fmt.Sprintf("openai stream: no model output for %s (SSE heartbeats do not count)", e.timeout)
+	}
 	return fmt.Sprintf("openai stream: no network progress for %s", e.timeout)
 }
 
@@ -245,14 +254,27 @@ func (e *streamTimeoutError) Temporary() bool { return true }
 
 func (e *streamTimeoutError) Unwrap() error { return context.DeadlineExceeded }
 
+func (e *streamTimeoutError) Is(target error) bool {
+	return e.generating && target == ErrIncompleteGeneration
+}
+
+type streamIdleKey struct{}
+
+func streamOutputActivity(ctx context.Context) {
+	if idle, ok := ctx.Value(streamIdleKey{}).(*streamIdle); ok {
+		idle.activity()
+	}
+}
+
 type streamIdle struct {
-	mu       sync.Mutex
-	ctx      context.Context
-	cancel   context.CancelCauseFunc
-	timeout  time.Duration
-	deadline time.Time
-	timer    *time.Timer
-	closed   bool
+	mu         sync.Mutex
+	ctx        context.Context
+	cancel     context.CancelCauseFunc
+	timeout    time.Duration
+	deadline   time.Time
+	timer      *time.Timer
+	closed     bool
+	generating bool
 }
 
 func (s *streamIdle) expire() {
@@ -267,7 +289,7 @@ func (s *streamIdle) expire() {
 		s.timer.Reset(remaining)
 		return
 	}
-	s.cancel(&streamTimeoutError{timeout: s.timeout})
+	s.cancel(&streamTimeoutError{timeout: s.timeout, generating: s.generating})
 }
 
 func (s *streamIdle) activity() {
@@ -298,9 +320,6 @@ func (b *streamBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if cause := context.Cause(b.idle.ctx); cause != nil {
 		return 0, cause
-	}
-	if n > 0 {
-		b.idle.activity()
 	}
 	return n, err
 }
@@ -486,6 +505,7 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 			if text == "" {
 				continue
 			}
+			streamOutputActivity(ctx)
 			switch chunk.Type {
 			case "response.output_text.delta":
 				part.Kind = "output_text"
@@ -520,7 +540,9 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 				return err
 			}
 			return context.Cause(ctx)
-		case "response.failed", "response.incomplete", "response.cancelled":
+		case "response.incomplete":
+			return incompleteResponse(chunk.Response)
+		case "response.failed", "response.cancelled":
 			return fmt.Errorf("openai responses %s: %s", chunk.Type, chunk.Response.failureDetail())
 		case "error", "response.error":
 			return fmt.Errorf("openai responses error: %s", firstNonEmpty(chunk.Message, chunk.Error.Message, chunk.Code, chunk.Error.Code, "unspecified API error"))
@@ -736,6 +758,9 @@ func (r responsesResponse) failureDetail() string {
 }
 
 func (r responsesResponse) completed() error {
+	if r.Status == "incomplete" {
+		return incompleteResponse(r)
+	}
 	if r.Status != "completed" || r.Error.Message != "" || r.Error.Code != "" {
 		return fmt.Errorf("openai responses did not complete: %s", r.failureDetail())
 	}

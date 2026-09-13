@@ -19,20 +19,17 @@ func streamTestEvents(api string) (string, string) {
 	return `{"choices":[{"delta":{"content":"answer"}}]}`, "[DONE]"
 }
 
-func TestStreamHeartbeatBytesOutliveRequestTimeout(t *testing.T) {
+func TestStreamHeartbeatCannotHideStalledGeneration(t *testing.T) {
 	for _, api := range []string{"responses", "chat_completions"} {
 		t.Run(api, func(t *testing.T) {
 			const timeout = 150 * time.Millisecond
 			client := responsesTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
-				// Keep one comment line open: activity must be observed below the
-				// SSE scanner, even when no complete line or token is available.
+				// An unfinished comment line produces network traffic, not output.
 				fmt.Fprint(w, ": heartbeat")
 				w.(http.Flusher).Flush()
 				ticker := time.NewTicker(10 * time.Millisecond)
 				defer ticker.Stop()
-				finish := time.NewTimer(3 * timeout)
-				defer finish.Stop()
 				for {
 					select {
 					case <-r.Context().Done():
@@ -40,10 +37,6 @@ func TestStreamHeartbeatBytesOutliveRequestTimeout(t *testing.T) {
 					case <-ticker.C:
 						fmt.Fprint(w, " ")
 						w.(http.Flusher).Flush()
-					case <-finish.C:
-						delta, terminal := streamTestEvents(api)
-						fmt.Fprintf(w, "\n\ndata: %s\n\ndata: %s\n\n", delta, terminal)
-						return
 					}
 				}
 			}, true, api)
@@ -51,8 +44,8 @@ func TestStreamHeartbeatBytesOutliveRequestTimeout(t *testing.T) {
 			// integer-second delays or a public testing-only configuration knob.
 			client.httpClient.Timeout = timeout
 			got, err := client.Chat(context.Background(), nil)
-			if err != nil || got != "answer" {
-				t.Fatalf("active stream = %q, %v", got, err)
+			if got != "" || !errors.Is(err, ErrIncompleteGeneration) {
+				t.Fatalf("heartbeat stalled stream = %q, %v", got, err)
 			}
 		})
 	}

@@ -24,8 +24,15 @@ type modalState struct {
 	editor    textarea.Model
 	err       string
 	findings  *findingsModal
+	sessions  *sessionsModal
 	agents    bool
 	budget    bool
+}
+
+type sessionsModal struct {
+	items    []string
+	selected int
+	starts   []int
 }
 
 func (m *Model) openBudgetPrompt() tea.Cmd {
@@ -101,6 +108,28 @@ func (m *Model) resizeModal() {
 	if m.modal.compose {
 		m.modal.editor.SetWidth(inner)
 		m.modal.editor.SetHeight(bodyHeight)
+		return
+	}
+	if s := m.modal.sessions; s != nil {
+		m.modal.wrapped = nil
+		s.starts = s.starts[:0]
+		for i, item := range s.items {
+			s.starts = append(s.starts, len(m.modal.wrapped))
+			marker := "  "
+			if i == s.selected {
+				marker = "> "
+			}
+			m.modal.wrapped = append(m.modal.wrapped, wrapLines(marker+item, inner)...)
+		}
+		if len(s.items) == 0 {
+			m.modal.wrapped = wrapLines("没有已保存的会话", inner)
+		} else {
+			row := s.starts[s.selected]
+			if row < m.modal.scroll || row >= m.modal.scroll+bodyHeight {
+				m.modal.scroll = row
+			}
+		}
+		m.modal.wrapWidth = inner
 		return
 	}
 	m.wrapModal(inner)
@@ -197,6 +226,9 @@ func (m *Model) updateModal(msg tea.Msg) tea.Cmd {
 		}
 		return cmd
 	}
+	if state.sessions != nil {
+		return m.updateSessions(msg)
+	}
 	if state.findings != nil && !state.findings.detail {
 		return m.updateFindings(msg)
 	}
@@ -222,11 +254,58 @@ func (m *Model) updateModal(msg tea.Msg) tea.Cmd {
 		switch event.Type {
 		case tea.MouseWheelUp:
 			delta = -3
+
 		case tea.MouseWheelDown:
 			delta = 3
 		}
 	}
 	state.scroll = min(max(0, state.scroll+delta), max(0, len(state.wrapped)-available))
+	return nil
+}
+
+func (m *Model) updateSessions(msg tea.Msg) tea.Cmd {
+	s := m.modal.sessions
+	if len(s.items) == 0 {
+		return nil
+	}
+	_, _, height := m.modalSize()
+	switch key := msg.(type) {
+	case tea.KeyMsg:
+		switch key.String() {
+		case "up":
+			s.selected--
+		case "down":
+			s.selected++
+		case "pgup":
+			s.selected -= height
+		case "pgdown":
+			s.selected += height
+		case "home":
+			s.selected = 0
+		case "end":
+			s.selected = len(s.items) - 1
+		case "enter":
+			if m.busy || m.saving {
+				m.modal.err = "请先暂停审计并等待保存完成"
+				return nil
+			}
+			m.restoreSession(s.items[s.selected])
+			if m.modal == nil {
+				return m.input.Focus()
+			}
+			return nil
+		}
+	case tea.MouseMsg:
+		if key.Type == tea.MouseWheelUp {
+			s.selected--
+		}
+		if key.Type == tea.MouseWheelDown {
+			s.selected++
+		}
+	}
+	s.selected = min(max(0, s.selected), len(s.items)-1)
+	m.modal.wrapWidth = 0
+	m.resizeModal()
 	return nil
 }
 

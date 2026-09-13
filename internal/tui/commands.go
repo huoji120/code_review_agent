@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,7 +18,7 @@ import (
 
 func (m *Model) submit(value string) tea.Cmd {
 	command, arg := parseCommand(value)
-	if strings.HasPrefix(value, "/") || command == "go" || command == "budget" || command == "restore" || command == "report" || command == "list" || command == "export" || command == "save" || command == "sessions" || command == "agents" {
+	if strings.HasPrefix(value, "/") || command == "go" || command == "budget" || command == "restore" || command == "report" || command == "list" || command == "export" || command == "save" || command == "session" || command == "sessions" || command == "agents" {
 		switch command {
 		case "say":
 			return m.openBroadcast(arg)
@@ -115,10 +116,10 @@ func (m *Model) submit(value string) tea.Cmd {
 			return m.startDirectory(arg)
 		case "save":
 			return m.saveSession(arg)
+		case "session", "sessions":
+			m.listSessions(arg)
 		case "restore":
 			m.restoreSession(arg)
-		case "sessions":
-			m.listSessions(arg)
 		case "list":
 			m.showFindings(arg)
 		case "report":
@@ -141,8 +142,8 @@ func (m *Model) submit(value string) tea.Cmd {
 				"/help、/agents、/report、/files [页码]、/sessions：独立可滚动对话框。",
 				"/list [页码]：漏洞选择列表；↑↓ 选择、Enter 详情、Esc 返回/关闭；后台继续运行。",
 				"/export [文件]：完整 JSON 报告，默认 report.json。",
-				"/save [文件]：保存当前会话；/sessions [页码]：列出会话。",
-				"/restore <文件>：恢复会话；运行或保存期间不可恢复或切换目录。",
+				"/save [文件]：保存当前会话；/session：选择会话，↑↓选择、Enter恢复。",
+				"/restore [文件/片段]：支持省略.json、唯一片段；多个匹配弹窗选择，运行或保存时不可恢复。",
 				"Tab 切换面板；论坛空输入时 ↑↓ 选帖、Enter 展开/收起、←→ 翻页。",
 				"点击帖子标题展开/收起；PgUp/PgDn、鼠标滚轮在当前页独立滚动。",
 				"/status：回到运行事件；窄屏用 Tab 切换状态与论坛。",
@@ -261,16 +262,28 @@ func (m *Model) restoreSession(path string) {
 	}
 	path = cleanInputDir(path)
 	if path == "" {
-		m.addEvent("用法：/restore <会话文件>")
+		m.listSessions("")
 		return
 	}
-	if !filepath.IsAbs(path) {
-		if _, err := os.Stat(path); err != nil {
-			path = filepath.Join(m.sessionDir, path)
+	if p, ok := m.resolveSessionPath(path); ok {
+		path = p
+	} else {
+		matches := m.sessionMatches(path)
+		if len(matches) == 1 {
+			path = matches[0]
+		} else if len(matches) > 1 {
+			m.openSessionPicker(matches)
+			return
+		} else {
+			m.addEvent("未找到会话：" + path)
+			return
 		}
 	}
 	if err := m.runner.LoadSession(path); err != nil {
 		m.addEvent("恢复会话失败：" + err.Error())
+		if m.modal != nil {
+			m.modal.err = "恢复失败：" + err.Error()
+		}
 		return
 	}
 	m.session++
@@ -284,11 +297,46 @@ func (m *Model) restoreSession(path string) {
 	m.workspace = "已恢复会话"
 	m.lastQuery = ""
 	m.modal = nil
+	m.input.Focus()
 	m.events = nil
 	m.scroll = [2]int{}
 	m.follow = [2]bool{true, true}
 	m.syncTeam()
 	m.addEvent("已恢复会话：" + path + "；输入 go 继续。")
+}
+func (m *Model) resolveSessionPath(path string) (string, bool) {
+	if info, err := os.Stat(path); err == nil && !info.IsDir() {
+		return path, true
+	}
+	for _, p := range []string{path + ".json", filepath.Join(m.sessionDir, path), filepath.Join(m.sessionDir, path+".json")} {
+		if filepath.IsAbs(path) && p != path+".json" {
+			continue
+		}
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p, true
+		}
+	}
+	return "", false
+}
+func (m *Model) sessionMatches(query string) []string {
+	entries, _ := os.ReadDir(m.sessionDir)
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q != "" {
+		q = strings.TrimSuffix(strings.ToLower(filepath.Base(q)), ".json")
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".json") {
+			continue
+		}
+		n := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+		l := strings.ToLower(n)
+		if strings.HasPrefix(l, q) || strings.Contains(l, q) {
+			out = append(out, filepath.Join(m.sessionDir, e.Name()))
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(out)))
+	return out
 }
 func pageRange(arg string, total, pageSize int) (int, int, int) {
 	page, _ := strconv.Atoi(strings.TrimSpace(arg))
@@ -350,23 +398,30 @@ func (m *Model) agentDetailLines() []string {
 	}
 	return lines
 }
+func (m *Model) openSessionPicker(items []string) {
+	state := &modalState{title: "已保存会话 · ↑↓ 选择 Enter 恢复", sessions: &sessionsModal{items: append([]string(nil), items...)}}
+	state.lines = make([]string, len(items))
+	for i, item := range items {
+		state.lines[i] = "  " + filepath.Base(item)
+	}
+	if len(items) > 0 {
+		state.lines[0] = "> " + filepath.Base(items[0])
+	}
+	m.modal = state
+	m.input.Blur()
+	m.resizeModal()
+}
 func (m *Model) listSessions(arg string) {
-	entries, err := os.ReadDir(m.sessionDir)
-	if err != nil {
+	if _, err := os.ReadDir(m.sessionDir); err != nil {
 		m.addEvent("读取会话目录失败：" + err.Error())
 		return
 	}
-	var names []string
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
-			names = append(names, entry.Name())
-		}
+	matches := m.sessionMatches(arg)
+	if strings.TrimSpace(arg) != "" && len(matches) == 0 {
+		m.addEvent("未找到会话：" + arg)
+		return
 	}
-	start, end, page := pageRange(arg, len(names), 25)
-	lines := []string{fmt.Sprintf("第 %d 页 · 共 %d 个；/sessions <页码>", page, len(names))}
-	lines = append(lines, names[start:end]...)
-	lines = append(lines, "恢复：/restore <文件名>")
-	m.showDetail("已保存会话", lines)
+	m.openSessionPicker(matches)
 }
 func (m *Model) showFindings(arg string) {
 	m.snapshot = m.runner.Snapshot()

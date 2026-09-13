@@ -62,6 +62,7 @@ func (g *generationTracker) add(textBytes, reasoningBytes, toolBytes int) error 
 	if textBytes+reasoningBytes+toolBytes == 0 {
 		return nil
 	}
+	streamOutputActivity(g.ctx)
 	g.textBytes += int64(textBytes)
 	g.reasoningBytes += int64(reasoningBytes)
 	g.toolBytes += int64(toolBytes)

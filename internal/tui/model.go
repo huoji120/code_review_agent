@@ -338,6 +338,22 @@ func (m *Model) handleKey(key tea.KeyMsg) (tea.Cmd, bool) {
 		m.stop()
 		return nil, true
 	case "tab":
+		if command, arg := parseCommand(m.input.Value()); command == "restore" {
+			query := cleanInputDir(arg)
+			matches := m.sessionMatches(query)
+			if exact, ok := m.resolveSessionPath(query); query != "" && ok {
+				matches = []string{exact}
+			}
+			if len(matches) == 1 {
+				m.input.SetValue("/restore \"" + matches[0] + "\"")
+				m.input.CursorEnd()
+			} else if len(matches) > 1 {
+				m.openSessionPicker(matches)
+			} else {
+				m.addEvent("未找到会话：" + query)
+			}
+			return nil, true
+		}
 		m.focus = 1 - m.focus
 		return nil, true
 	case "up", "down":

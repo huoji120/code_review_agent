@@ -8,6 +8,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"code-review-agent/internal/llm"
 )
 
 func waitModelRetry(ctx context.Context, delay time.Duration) error {
@@ -45,6 +47,7 @@ func (a *Agent) modelRequest(ctx context.Context, emit func(Event), request func
 	if wait == nil {
 		wait = waitModelRetry
 	}
+	incompleteRetries := 0
 	for attempt := 0; attempt < 4; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -55,6 +58,19 @@ func (a *Agent) modelRequest(ctx context.Context, emit func(Event), request func
 		}
 		if err == nil {
 			return answer, nil
+		}
+		if errors.Is(err, llm.ErrIncompleteGeneration) {
+			if incompleteRetries == 3 {
+				return "", fmt.Errorf("生成未完成，回退到上次完整结果后重试3次仍失败；保留进度，输入 go 可继续: %w", err)
+			}
+			incompleteRetries++
+			if emit != nil {
+				emit(Event{Kind: "info", Content: fmt.Sprintf("生成未完成：%v；丢弃本次残缺输出，回退到上次完整结果，重试 %d/3", err, incompleteRetries)})
+			}
+			// The caller commits model output only on success. Repeat generation
+			// from that boundary, never replay the preceding successful tool.
+			attempt--
+			continue
 		}
 		if !isModelDisconnect(err) {
 			return "", err

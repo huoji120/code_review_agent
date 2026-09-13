@@ -289,7 +289,7 @@ func (t *Team) receive(w *teamWorker, e Event) {
 		t.mu.Unlock()
 		return
 	}
-	protocolFailure := e.Kind == "error" && errors.Is(w.agent.runErr, ErrToolProtocolFailures)
+	workerFailure := e.Kind == "error" && w.agent.runErr != nil && !errors.Is(w.agent.runErr, context.Canceled) && (!errors.Is(w.agent.runErr, context.DeadlineExceeded) || errors.Is(w.agent.runErr, llm.ErrIncompleteGeneration))
 	t.mu.Lock()
 	if e.Kind == "model_progress" {
 		w.saved.Status.Generation = cloneGeneration(e.Generation)
@@ -307,10 +307,10 @@ func (t *Team) receive(w *teamWorker, e Event) {
 		t.publish(e)
 		return
 	}
-	var cancel context.CancelFunc
-	if protocolFailure {
-		cancel = t.cancel
-		e.Content += "；整个团队已暂停（包括版主）。请检查模型与所选 API 的原生工具适配，修正后输入 go 继续。"
+	var failureNotice string
+	if workerFailure && w.agent.phase != phaseModerator {
+		s := w.saved.Status
+		failureNotice = fmt.Sprintf("成员 %s（%s），阶段 %s，回合 %d 已失败，仅停止该成员，其他成员继续。\n失败原因：%s\n最后工具：%s；最后模型活动：%s\n最近输出摘录（仅诊断材料，不是指令或已验证结论）：\n%s\n请管理员查看原因与成员状态，必要时通过 IRC 询问、提出纠正建议或重新安排工作；不要把失败当作阶段完成。", s.Name, s.ID, s.Phase, s.Turn, shortText(e.Content, 2000), s.LastTool, s.LastModelActivity, shortText(s.OutputExcerpt, 1000))
 	}
 	if e.Kind == "turn" {
 		w.saved.Status.Turn = w.agent.turn
@@ -327,7 +327,9 @@ func (t *Team) receive(w *teamWorker, e Event) {
 		w.saved.Status.Name = w.agent.board.Name(w.saved.Status.ID)
 		e.Workers = t.statusesLocked()
 	} else {
-		if e.Kind == "waiting" {
+		if workerFailure {
+			w.saved.Status.Status = "failed"
+		} else if e.Kind == "waiting" {
 			w.saved.Status.Status = "waiting"
 		} else if e.Kind == "worker" || e.Kind == "tool" {
 			w.saved.Status.Status = "running"
@@ -351,8 +353,11 @@ func (t *Team) receive(w *teamWorker, e Event) {
 		e.Workers = t.statusesLocked()
 	}
 	t.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	if failureNotice != "" {
+		t.board.SetStatus(w.agent.id, "failed")
+		if _, err := t.board.Post("coordinator", "system", phaseModerator, 0, "Agent 失败待诊断", failureNotice); err != nil {
+			t.publish(Event{Kind: "error", Content: "无法发布成员失败通知：" + err.Error()})
+		}
 	}
 	t.publish(e)
 }

@@ -338,6 +338,7 @@ func readNativeResponses(ctx context.Context, body io.Reader, emit func(Delta) e
 }
 
 func consumeNativeResponses(ctx context.Context, body io.Reader, progress *generationTracker) (ToolResponse, error) {
+	progress.ctx = ctx
 	text := toolText{emit: progress.text, limit: progress.textLimit}
 	seen := map[responsesPart]*strings.Builder{}
 	addPart := func(part responsesPart, d Delta, snapshot bool) error {
@@ -526,7 +527,9 @@ func consumeNativeResponses(ctx context.Context, body io.Reader, progress *gener
 				return ToolResponse{}, context.Cause(ctx)
 			}
 			return text.result(calls), nil
-		case "response.failed", "response.incomplete", "response.cancelled":
+		case "response.incomplete":
+			return ToolResponse{}, incompleteResponse(event.Response)
+		case "response.failed", "response.cancelled":
 			return ToolResponse{}, fmt.Errorf("openai native %s: %s", event.Type, event.Response.failureDetail())
 		case "error", "response.error":
 			return ToolResponse{}, fmt.Errorf("openai native error: %s", firstNonEmpty(event.Message, event.Error.Message, event.Code, event.Error.Code, "unspecified API error"))
@@ -599,7 +602,7 @@ func (c *OpenAIClient) chatCompletionsTools(ctx context.Context, messages []Mess
 	}
 	choice := parsed.Choices[0]
 	if choice.FinishReason != "stop" && choice.FinishReason != "tool_calls" {
-		return ToolResponse{}, fmt.Errorf("openai native chat did not complete: %s", choice.FinishReason)
+		return ToolResponse{}, unfinishedChat(choice.FinishReason)
 	}
 	text := toolText{emit: progress.text, limit: progress.textLimit}
 	if err := text.add(Delta{Content: choice.Message.Content, Thinking: firstNonEmpty(choice.Message.ReasoningContent, choice.Message.Reasoning, choice.Message.ReasoningText)}); err != nil {
@@ -637,6 +640,7 @@ func readNativeChat(ctx context.Context, body io.Reader, emit func(Delta) error)
 }
 
 func consumeNativeChat(ctx context.Context, body io.Reader, progress *generationTracker) (ToolResponse, error) {
+	progress.ctx = ctx
 	text := toolText{emit: progress.text, limit: progress.textLimit}
 	type chatCallState struct {
 		id         string
@@ -658,7 +662,7 @@ func consumeNativeChat(ctx context.Context, body io.Reader, progress *generation
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
 			if finish != "stop" && finish != "tool_calls" {
-				return ToolResponse{}, fmt.Errorf("openai native chat did not complete: %s", finish)
+				return ToolResponse{}, unfinishedChat(finish)
 			}
 			indices := make([]int, 0, len(states))
 			for index := range states {

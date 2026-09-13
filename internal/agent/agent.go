@@ -750,7 +750,7 @@ func (a *Agent) chatStream(ctx context.Context, emit func(Event)) (llm.ToolRespo
 		a.addMessage(llm.Message{Role: llm.RoleUser, Content: feedback})
 		emit(Event{Kind: "info", Content: feedback})
 		if a.protocolFailures >= 3 {
-			return llm.ToolResponse{}, fmt.Errorf("%w：%v；整个任务已暂停，请检查模型和 API 工具适配后输入 go 继续", ErrToolProtocolFailures, err)
+			return llm.ToolResponse{}, fmt.Errorf("%w：%v；当前 Agent 已失败并保留进度，由管理员检查原因，其他成员继续", ErrToolProtocolFailures, err)
 		}
 	}
 }
