@@ -17,7 +17,7 @@ import (
 
 func (m *Model) submit(value string) tea.Cmd {
 	command, arg := parseCommand(value)
-	if strings.HasPrefix(value, "/") || command == "go" || command == "restore" || command == "report" || command == "list" || command == "export" || command == "save" || command == "sessions" || command == "agents" {
+	if strings.HasPrefix(value, "/") || command == "go" || command == "budget" || command == "restore" || command == "report" || command == "list" || command == "export" || command == "save" || command == "sessions" || command == "agents" {
 		switch command {
 		case "say":
 			return m.openBroadcast(arg)
@@ -101,7 +101,17 @@ func (m *Model) submit(value string) tea.Cmd {
 			cmd := m.runQuery(query)
 			m.lastQuery = previous
 			return cmd
+		case "budget":
+			if m.busy || m.saving {
+				m.addEvent("运行或保存期间不可修改预算。")
+				return nil
+			}
+			return m.openBudgetPrompt()
 		case "dir":
+			if m.budgetCfg.InfiniteMode {
+				m.pendingDir = arg
+				return m.openBudgetPrompt()
+			}
 			return m.startDirectory(arg)
 		case "save":
 			return m.saveSession(arg)
@@ -122,6 +132,7 @@ func (m *Model) submit(value string) tea.Cmd {
 		case "help":
 			m.showDetail("操作帮助", []string{
 				"输入目录或 /dir <目录>：开始新审计；支持带空格的引号路径。",
+				"/budget：停止时设置 normal|infinite 小时 分钟 tokens；Ctrl+S 确认，0 表示不限，时间/token任一耗尽即停。",
 				"Esc：对话框内关闭/取消；其他时候请求暂停，worker 停止后 go 继续。",
 				"/say [消息]：打开广播草稿；Enter 换行，Ctrl+S 发送，Esc 取消。",
 				"/thread <ID>：展开帖子及楼内回复；/forum [页码]：返回倒序帖子列表。",
@@ -154,9 +165,17 @@ func (m *Model) submit(value string) tea.Cmd {
 	}
 	path := cleanInputDir(value)
 	if !m.workspaceReady {
+		if m.budgetCfg.InfiniteMode {
+			m.pendingDir = path
+			return m.openBudgetPrompt()
+		}
 		return m.startDirectory(path)
 	}
 	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		if m.budgetCfg.InfiniteMode {
+			m.pendingDir = path
+			return m.openBudgetPrompt()
+		}
 		return m.startDirectory(path)
 	}
 	return m.runQuery(value)

@@ -6,6 +6,9 @@ import (
 )
 
 type generationUsage struct {
+	TotalTokens      *int64 `json:"total_tokens"`
+	InputTokens      *int64 `json:"input_tokens"`
+	PromptTokens     *int64 `json:"prompt_tokens"`
 	OutputTokens     *int64 `json:"output_tokens"`
 	CompletionTokens *int64 `json:"completion_tokens"`
 	OutputDetails    struct {
@@ -26,6 +29,7 @@ type generationTracker struct {
 	lastEmit                             time.Time
 	receivedAt                           time.Time
 	dirty                                bool
+	textLimit                            int
 }
 
 func newGenerationTracker(ctx context.Context, emit func(Delta) error) (*generationTracker, error) {

@@ -76,6 +76,8 @@ type Team struct {
 	ircNextID          int64
 	ircChanged         chan struct{}
 	stageOpen          bool
+	budget             auditBudget
+	userBroadcasts     []userBroadcast
 }
 
 func NewTeam(cfg config.Config, prompts prompt.Prompts, client, compressClient llm.Client, registry *tools.Registry) *Team {
@@ -127,6 +129,10 @@ func (t *Team) resetBoard() {
 
 func (t *Team) cancelStageWorkers(stage string) {
 	t.mu.Lock()
+	if t.cfg.Agent.InfiniteMode {
+		t.mu.Unlock()
+		return
+	}
 	cancels := make([]context.CancelFunc, 0, len(t.workerCancels[stage]))
 	for _, cancel := range t.workerCancels[stage] {
 		cancels = append(cancels, cancel)
@@ -167,11 +173,13 @@ func (t *Team) SetWorkspace(workspace string) error {
 	t.revocations = nil
 	t.pendingAssignments = nil
 	t.ircMessages, t.ircNextID = nil, 0
+	t.userBroadcasts = nil
 	t.stageOpen = false
 	t.signalIRCLocked()
 	t.workers = nil
 	t.phase, t.input, t.handoff = phaseRecon, "", ""
 	t.snapshot = tools.Snapshot{}
+	t.budget = auditBudget{}
 	t.resetBoard()
 	return nil
 }
@@ -215,10 +223,14 @@ func (t *Team) ForumMessages() []forum.Message {
 	return b.Messages()
 }
 func (t *Team) PostMessage(content string) error {
+	if err := validateUserBroadcast(content); err != nil {
+		return err
+	}
 	t.mu.Lock()
 	b := t.board
+	t.userBroadcasts = append(t.userBroadcasts, userBroadcast{ID: int64(len(t.userBroadcasts)) + 1, Content: content})
 	t.mu.Unlock()
-	_, err := b.Post("user", "user", "*", 0, "用户补充", strings.TrimSpace(content))
+	_, err := b.Post("user", "user", "*", 0, "用户补充", content)
 	return err
 }
 
@@ -247,6 +259,7 @@ func (t *Team) capture(w *teamWorker, a *Agent) {
 	cp := workerSession{Status: WorkerStatus{ID: a.id, Phase: a.phase, Turn: a.turn}, Assignment: a.assignment, Messages: append([]llm.Message(nil), a.messages...), Skills: a.prompts.LoadedSkillNames(), Snapshot: cloneSnapshot(a.tools.Snapshot()), Plan: a.plan, TracePath: a.TracePath(), Completed: a.completed, ForumCursor: a.forumCursor, ForumPending: a.forumPending, AnnouncedName: a.announcedName}
 	t.mu.Lock()
 	cp.Status.Name = a.board.Name(a.id)
+	cp.UserBroadcastCursor, cp.UserBroadcastDelivered = a.userBroadcastCursor, a.userBroadcastDelivered
 	cp.Status.Status, cp.Status.Activity = w.saved.Status.Status, w.saved.Status.Activity
 	cp.Status.Generation = cloneGeneration(w.saved.Status.Generation)
 	cp.Status.LastModelActivity = w.saved.Status.LastModelActivity
@@ -364,6 +377,7 @@ func (t *Team) createStageLocked(stage string) {
 	for i := 0; i < count; i++ {
 		id := fmt.Sprintf("%s-%d", stage, i+1)
 		a := newWorker(t.cfg, t.prompts, t.client, t.compressClient, t.registry.Fork(), id, stage, t.board)
+		a.userBroadcastSource = t.broadcastsAfter
 		a.onDisconnect = t.modelDisconnected
 		a.assignment = assignment
 		if stage == phaseAudit {
@@ -393,11 +407,23 @@ func (t *Team) Run(ctx context.Context, input string, emit func(Event)) {
 	t.running = true
 	t.done = make(chan struct{})
 	t.emitter = emit
+	runCtx = t.startBudgetLocked(runCtx, cancelRun)
 	if t.workerCancels == nil {
 		t.workerCancels = make(map[string]map[string]context.CancelFunc)
 	}
 	if t.input == "" {
 		t.input = input
+	}
+	if t.cfg.Agent.InfiniteMode {
+		t.board.ResetConsensus(phaseAudit)
+		for _, w := range t.workers {
+			if w.agent.phase == phaseAudit && w.saved.Completed {
+				w.saved.Completed, w.agent.completed = false, false
+				w.saved.Status.Status = "pending"
+				w.saved.Snapshot.Audit = tools.AuditState{}
+				w.agent.tools.RestoreSnapshot(w.saved.Snapshot)
+			}
+		}
 	}
 	if t.phase == "completed" {
 		t.board.ResetConsensus(phaseAudit)
@@ -438,6 +464,10 @@ func (t *Team) Run(ctx context.Context, input string, emit func(Event)) {
 		t.mu.Unlock()
 		t.emitMu.Unlock()
 	}()
+	defer t.finishBudget()
+	if runCtx.Err() != nil {
+		return
+	}
 	stopModerator := t.startModerator(runCtx)
 	defer func() { stopModerator() }()
 	for {

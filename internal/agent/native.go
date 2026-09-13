@@ -40,6 +40,9 @@ func (a *Agent) toolDefinitionTokens() int {
 }
 
 func (a *Agent) toolPermission(name string) string {
+	if a.cfg.Agent.InfiniteMode && (name == "end_audit" || name == "moderator_decide") {
+		return "无限模式没有结束审计工具；继续审计，停止由用户或预算控制。"
+	}
 	if a.toolsDisabled {
 		return "工具调用已禁用；请根据已有证据直接给出结论。"
 	}
@@ -82,7 +85,7 @@ func specialToolDefinitions() []llm.ToolDefinition {
 		makeTool("read_handoff", "读取前一阶段完整结构化交接；超长结果按工具 buffer 分页。", `{"type":"object","properties":{},"additionalProperties":false}`),
 		makeTool("load_skill", "按名称加载本次任务需要的可用技能。", `{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}`),
 		makeTool("audit_plan_done", "提交侦察交接并结束当前侦察 worker。audit_files 必须是实际文件路径。", `{"type":"object","properties":{"summary":{"type":"string"},"audit_map":{"type":"string"},"audit_files":{"type":"array","items":{"type":"string"}},"execute_instructions":{"type":"string"}},"required":["summary","audit_map","audit_files"],"additionalProperties":false}`),
-		makeTool("end_audit", "请求本阶段团队关闭并明确投票；失败后继续有价值的审计。", `{"type":"object","properties":{"summary":{"type":"string"},"next_steps":{"type":"string"},"vote":{"type":"string","enum":["approve","reject"]}},"required":["summary","vote"],"additionalProperties":false}`),
+		makeTool("end_audit", "请求团队关闭并明确投票；待定、拒绝或超时后继续自己的审计，选择其他未覆盖代码建立待办并读取源码。不催票、不重复关闭、不围绕同伴结论重复复核。", `{"type":"object","properties":{"summary":{"type":"string"},"next_steps":{"type":"string"},"vote":{"type":"string","enum":["approve","reject"]}},"required":["summary","vote"],"additionalProperties":false}`),
 		makeTool("verify_finding", "启动独立验证 Agent 复核候选漏洞，不直接登记漏洞。", `{"type":"object","properties":{"severity":{"type":"string"},"title":{"type":"string"},"path":{"type":"string"},"line":{"type":"integer"},"evidence":{"type":"string"},"impact":{"type":"string"},"recommendation":{"type":"string"},"cwe":{"type":"string"}},"required":["title","path","evidence"],"additionalProperties":false}`),
 		makeTool("moderator_idle", "结束本次管理员激活，等待新活动。", `{"type":"object","properties":{},"additionalProperties":false}`),
 		makeTool("moderator_review_state", "读取成员与漏洞快照、稳定 finding_key。", `{"type":"object","properties":{},"additionalProperties":false}`),

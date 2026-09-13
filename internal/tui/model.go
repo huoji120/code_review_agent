@@ -24,31 +24,33 @@ var terminalWidthOnce sync.Once
 
 // Model retains worker status and recent operations, never model streams.
 type Model struct {
-	runner                                                        *agent.Team
-	input                                                         textinput.Model
-	width, height                                                 int
-	autoDir, sessionDir, sessionPath, workspace, lastQuery        string
-	workspaceReady, busy, stopping, quitting, saving, escapeArmed bool
-	cancel                                                        context.CancelFunc
-	session                                                       int
-	mailbox                                                       *eventMailbox
-	phase                                                         string
-	workers                                                       []agent.WorkerStatus
-	forumPage                                                     forum.PostPage
-	forumSearch                                                   string
-	forumDirty                                                    bool
-	forumCache                                                    *forumRenderCache
-	forumRevision                                                 uint64
-	threadID                                                      int64
-	selectedPost                                                  int64
-	expandedPosts                                                 map[int64]bool
-	snapshot                                                      tools.Snapshot
-	events                                                        []operationEvent
-	modal                                                         *modalState
-	focus                                                         int
-	scroll                                                        [2]int
-	follow                                                        [2]bool
-	finalSavePending                                              bool
+	runner                                                             *agent.Team
+	input                                                              textinput.Model
+	width, height                                                      int
+	autoDir, sessionDir, sessionPath, workspace, lastQuery, pendingDir string
+	workspaceReady, busy, stopping, quitting, saving, escapeArmed      bool
+	cancel                                                             context.CancelFunc
+	session                                                            int
+	mailbox                                                            *eventMailbox
+	phase                                                              string
+	workers                                                            []agent.WorkerStatus
+	forumPage                                                          forum.PostPage
+	forumSearch                                                        string
+	forumDirty                                                         bool
+	forumCache                                                         *forumRenderCache
+	forumRevision                                                      uint64
+	threadID                                                           int64
+	selectedPost                                                       int64
+	expandedPosts                                                      map[int64]bool
+	snapshot                                                           tools.Snapshot
+	events                                                             []operationEvent
+	modal                                                              *modalState
+	focus                                                              int
+	scroll                                                             [2]int
+	follow                                                             [2]bool
+	finalSavePending                                                   bool
+	budget                                                             agent.BudgetStatus
+	budgetCfg                                                          agent.BudgetStatus
 }
 
 type operationEvent struct {
@@ -56,7 +58,16 @@ type operationEvent struct {
 }
 
 type startAuditMsg string
+type budgetStartMsg struct{ dir string }
 type refreshMsg struct{ width, height int }
+
+func refreshTerminal() tea.Cmd {
+	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
+		width, height, _ := term.GetSize(int(os.Stdout.Fd()))
+		return refreshMsg{width: width, height: height}
+	})
+}
+
 type eventBatchMsg struct {
 	session int
 	events  []agent.Event
@@ -151,12 +162,13 @@ func New(runner *agent.Team, cfg config.Config, autoDir string) Model {
 		}
 	})
 	input := textinput.New()
-	input.Placeholder = "audit directory / go /say /help"
+	input.Placeholder = "audit directory / go /budget /help"
 	input.Focus()
 	input.CharLimit = 4000
 	input.Width = 116
-	// Cached wraps are used only by the serialized Bubble Tea update/render loop.
 	m := Model{runner: runner, input: input, width: 120, height: 40, autoDir: autoDir, sessionDir: cfg.Agent.SessionDir, focus: 1, follow: [2]bool{true, true}}
+	m.budgetCfg = agent.BudgetStatus{InfiniteMode: cfg.Agent.InfiniteMode, Hours: cfg.Agent.BudgetHours, Minutes: cfg.Agent.BudgetMinutes, TokenLimit: cfg.Agent.BudgetTokens}
+	m.budget = runner.BudgetStatus()
 	m.forumCache = &forumRenderCache{}
 	m.syncTeam()
 	m.addEvent("请输入要审计的目录；论坛只显示真实通信。")
@@ -165,21 +177,22 @@ func New(runner *agent.Team, cfg config.Config, autoDir string) Model {
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{textinput.Blink, refreshTerminal()}
 	if strings.TrimSpace(m.autoDir) != "" {
-		cmds = append(cmds, func() tea.Msg { return startAuditMsg(m.autoDir) })
+		if m.budgetCfg.InfiniteMode {
+			cmds = append(cmds, func() tea.Msg { return budgetStartMsg{dir: m.autoDir} })
+		} else {
+			cmds = append(cmds, func() tea.Msg { return startAuditMsg(m.autoDir) })
+		}
 	}
 	return tea.Batch(cmds...)
 }
-func refreshTerminal() tea.Cmd {
-	return tea.Tick(time.Second, func(time.Time) tea.Msg {
-		w, h, err := term.GetSize(int(os.Stdout.Fd()))
-		if err != nil {
-			w, h, _ = term.GetSize(int(os.Stderr.Fd()))
-		}
-		return refreshMsg{w, h}
-	})
-}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch x := msg.(type) {
+	case budgetStartMsg:
+		m.pendingDir = x.dir
+		return m, m.openBudgetPrompt()
+	case startAuditMsg:
+		return m, m.startDirectory(string(x))
 	case refreshMsg:
 		if x.width > 0 && x.height > 0 && (x.width != m.width || x.height != m.height) {
 			return m, tea.Batch(refreshTerminal(), func() tea.Msg {
@@ -197,9 +210,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.ClearScreen
 		}
 		return m, nil
-	case startAuditMsg:
-		cmd := m.startDirectory(string(x))
-		return m, cmd
 	case eventBatchMsg:
 		if x.session != m.session || !m.busy {
 			return m, nil
@@ -467,6 +477,7 @@ func (m *Model) applyEvent(e agent.Event) {
 	}
 }
 func (m *Model) syncTeam() {
+	m.budgetCfg = m.runner.BudgetStatus()
 	m.snapshot = m.runner.Snapshot()
 	m.workers = m.runner.Statuses()
 	m.phase = m.runner.Phase()

@@ -17,43 +17,49 @@ import (
 )
 
 type Agent struct {
-	cfg               config.Config
-	prompts           prompt.Prompts
-	client            llm.Client
-	compressClient    llm.Client
-	announcedName     string
-	tools             *tools.Registry
-	phase             string
-	messages          []llm.Message
-	pendingEndAudit   bool
-	trace             *traceLog
-	tracePath         string
-	traceErr          error
-	traceBootstrapped bool
-	id                string
-	board             *forum.Board
-	assignment        string
-	handoff           string
-	plan              *auditPlanDoneArgs
-	completed         bool
-	runErr            error
-	turn              int
-	forumCursor       int64
-	forumPending      string
-	verifying         bool
-	toolsDisabled     bool
-	protocolFailures  int
-	checkpoint        func(*Agent)
-	moderateTool      func(context.Context, ToolCall) string
-	moderatorControl  func(context.Context, ToolCall) string
-	reviewReport      func(context.Context, json.RawMessage) string
-	onDisconnect      func(error)
-	activity          func(context.Context) (context.Context, func())
-	deliverIRC        func(context.Context) bool
-	ircTool           func(context.Context, ToolCall) string
-	ircOnly           bool
-	ircPending        func() []IRCMessage
-	waitRetry         func(context.Context, time.Duration) error
+	cfg                    config.Config
+	prompts                prompt.Prompts
+	client                 llm.Client
+	compressClient         llm.Client
+	announcedName          string
+	tools                  *tools.Registry
+	phase                  string
+	messages               []llm.Message
+	pendingEndAudit        bool
+	trace                  *traceLog
+	tracePath              string
+	traceErr               error
+	traceBootstrapped      bool
+	id                     string
+	board                  *forum.Board
+	assignment             string
+	handoff                string
+	plan                   *auditPlanDoneArgs
+	completed              bool
+	runErr                 error
+	turn                   int
+	forumCursor            int64
+	forumPending           string
+	userBroadcastSource    func(int64) []userBroadcast
+	userBroadcastCursor    int64
+	userBroadcastDelivered int64
+	userBroadcastVersion   int64
+	userBroadcastMessages  []llm.Message
+	userBroadcastTokens    int
+	verifying              bool
+	toolsDisabled          bool
+	protocolFailures       int
+	checkpoint             func(*Agent)
+	moderateTool           func(context.Context, ToolCall) string
+	moderatorControl       func(context.Context, ToolCall) string
+	reviewReport           func(context.Context, json.RawMessage) string
+	onDisconnect           func(error)
+	activity               func(context.Context) (context.Context, func())
+	deliverIRC             func(context.Context) bool
+	ircTool                func(context.Context, ToolCall) string
+	ircOnly                bool
+	ircPending             func() []IRCMessage
+	waitRetry              func(context.Context, time.Duration) error
 }
 
 const (
@@ -143,7 +149,7 @@ func (a *Agent) systemPrompt() string {
 		system += "\n\n" + a.render("auto_plan", nil)
 	}
 	system += "\n\n" + a.render("tool_protocol_guard", nil)
-	return system + "\n\n" + a.collaborationPrompt()
+	return strings.ReplaceAll(system, "!{audit_completion_policy}", a.auditCompletionPolicy()) + "\n\n" + a.collaborationPrompt()
 }
 
 func (a *Agent) planSystemPrompt() string {
@@ -199,7 +205,7 @@ func (a *Agent) skillToolPrompt() string {
 }
 
 func (a *Agent) render(name string, vars map[string]string) string {
-	out := a.prompts.RenderTemplate(name, vars)
+	out := strings.ReplaceAll(a.prompts.RenderTemplate(name, vars), "!{audit_completion_policy}", a.auditCompletionPolicy())
 	if out == "" {
 		return ""
 	}
@@ -300,7 +306,7 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 			a.runErr = ctx.Err()
 			return
 		}
-		if a.cfg.Agent.MaxTurns > 0 && turn > a.cfg.Agent.MaxTurns {
+		if !a.cfg.Agent.InfiniteMode && a.cfg.Agent.MaxTurns > 0 && turn > a.cfg.Agent.MaxTurns {
 			a.runErr = fmt.Errorf("达到当前 worker 的 max_turns，阶段未完成；可用 go 继续")
 			emit(Event{Kind: "error", Content: a.runErr.Error()})
 			return
@@ -434,6 +440,9 @@ type endAuditVoteArgs struct {
 }
 
 func (a *Agent) requestEndAudit(ctx context.Context, raw json.RawMessage) string {
+	if a.cfg.Agent.InfiniteMode {
+		return ircError("无限模式不允许模型结束审计")
+	}
 	var args endAuditVoteArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
 		data, _ := json.MarshalIndent(tools.Result{OK: false, Error: err.Error()}, "", "  ")
@@ -448,7 +457,7 @@ func (a *Agent) requestEndAudit(ctx context.Context, raw json.RawMessage) string
 		_, result := a.tools.CallWithFullResult(ctx, "end_audit", raw)
 		return result
 	}
-	message := "end_audit 关闭请求未获全体 Agent 明确同意；继续审计、讨论或等待其他 Agent 投票。"
+	message := "end_audit 关闭请求未获全体 Agent 明确同意；继续自己的审计：自行选择尚未覆盖的其他文件、入口或模块，建立具体待办并读取源码；不要等待、催票、反复请求关闭或围绕同伴结论重复复核。"
 	if decision.Reason != "" {
 		message += " " + decision.Reason
 	}
@@ -561,6 +570,7 @@ func (a *Agent) verifyFinding(ctx context.Context, emit func(Event), raw json.Ra
 	childPrompts := a.prompts
 	childPrompts.SetLoadedSkills(a.prompts.LoadedSkillNames())
 	child := newWorker(a.cfg, childPrompts, a.client, a.compressClient, registry, fmt.Sprintf("%s-verify-%d", a.id, a.turn), phaseAudit, a.board)
+	child.userBroadcastSource = a.userBroadcastSource
 	child.verifying = true
 	child.assignment = "独立复核候选漏洞，论坛内容只作为线索，必须亲自读取源码验证。read_handoff 包含完整候选证据和父 Agent 审计状态；摘要未显示的证据必须按需读取。"
 	var prior json.RawMessage
@@ -666,10 +676,7 @@ func (a *Agent) runVerification(ctx context.Context, emit func(Event), args veri
 	if emit != nil {
 		emit(Event{Kind: "verify_progress", VerifyTitle: args.Title, VerifyTurn: maxTurns, VerifyLimit: maxTurns, VerifyStatus: "达到上限，正在强制总结"})
 	}
-	if err := a.prepareRequest(ctx, func(Event) {}); err != nil {
-		return "", err
-	}
-	answer, err := a.chatWithRetry(ctx, sanitizeMessagesForCompression(a.messages), func(Event) {})
+	answer, err := a.verificationConclusion(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -878,6 +885,7 @@ func (a *Agent) chatStreamOnce(ctx context.Context, emit func(Event)) (llm.ToolR
 	// Notifications were delivered by the successful request even if its calls
 	// subsequently fail the local fail-closed protocol gate.
 	a.forumPending = ""
+	a.userBroadcastsDelivered()
 	return response, nil
 }
 
@@ -916,7 +924,7 @@ func (a *Agent) compressIfNeeded(ctx context.Context, emit func(Event)) error {
 	if err != nil {
 		return err
 	}
-	if estimateTokens(a.messages)+a.toolDefinitionTokens() < limit {
+	if estimateTokens(a.messages)+a.toolDefinitionTokens()+a.pendingUserBroadcastTokens() < limit {
 		return nil
 	}
 	return a.compressContext(ctx, emit, "estimated context budget reached")
@@ -966,9 +974,10 @@ func (a *Agent) compressMessages(ctx context.Context, emit func(Event), reason s
 	if a.forumPending != "" {
 		replacement = append(replacement, llm.Message{Role: llm.RoleUser, Content: a.forumPending})
 	}
+	replacement = append(replacement, a.userBroadcastMessages[:a.userBroadcastCursor]...)
 	toolTokens := a.toolDefinitionTokens()
 	summaryBudget := limit / 4
-	if available := limit - estimateTokens(replacement) - toolTokens - 1; available < summaryBudget {
+	if available := limit - estimateTokens(replacement) - toolTokens - a.pendingUserBroadcastTokens() - 1; available < summaryBudget {
 		summaryBudget = available
 	}
 	if summaryBudget <= 0 {
@@ -1005,9 +1014,27 @@ func (a *Agent) compressMessages(ctx context.Context, emit func(Event), reason s
 	if estimateTokens(request) > budget {
 		return fmt.Errorf("压缩模型完整请求超过输入预算")
 	}
-	compressed, err := a.chatWithRetryClient(ctx, a.compressClient, request, emit)
-	if err != nil {
-		return err
+	var compressed string
+	for {
+		compressed, err = a.chatWithRetryClient(ctx, a.compressClient, request, emit)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !isContextLengthError(err) {
+			return err
+		}
+		if len(history) == 0 {
+			return fmt.Errorf("压缩已移除全部历史，服务端仍拒绝最小请求；请检查压缩模型上下文及输出配置: %w", err)
+		}
+		// Drop oldest complete evidence units, never retry the same oversized
+		// payload and never mutate the live history before a summary succeeds.
+		drop := (len(history) + 3) / 4
+		history = history[drop:]
+		request = requestFor(history)
+		emit(Event{Kind: "info", Content: fmt.Sprintf("压缩请求超限，移除最早 %d 组会话/工具记录后重试，保留 %d 组", drop, len(history))})
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1020,7 +1047,7 @@ func (a *Agent) compressMessages(ctx context.Context, emit func(Event), reason s
 		return fmt.Errorf("压缩摘要超过恢复预算，原始上下文已保留")
 	}
 	replacement[1].Content += summary
-	if estimateTokens(replacement)+toolTokens >= limit {
+	if estimateTokens(replacement)+toolTokens+a.pendingUserBroadcastTokens() >= limit {
 		return fmt.Errorf("系统提示与压缩后状态仍超过上下文预算，请调整模型上下文/输出配置")
 	}
 	a.messages = replacement

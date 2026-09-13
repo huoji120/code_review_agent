@@ -509,7 +509,7 @@ func (t *Team) startStageActors(ctx context.Context, stage, input string) func()
 				t.mu.Lock()
 				delete(t.workerCancels[stage], w.agent.id)
 				t.mu.Unlock()
-				if stage == phaseAudit && stageCtx.Err() == nil {
+				if !t.cfg.Agent.InfiniteMode && stage == phaseAudit && stageCtx.Err() == nil {
 					if decision, approved := t.board.ConsensusApprovedForStage(stage); approved {
 						w.agent.completed = true
 						s := w.agent.tools.Snapshot()

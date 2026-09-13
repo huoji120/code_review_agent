@@ -13,18 +13,20 @@ import (
 )
 
 type workerSession struct {
-	Status               WorkerStatus       `json:"status"`
-	Assignment           string             `json:"assignment"`
-	Messages             []llm.Message      `json:"messages"`
-	Skills               []string           `json:"skills,omitempty"`
-	TracePath            string             `json:"trace_path,omitempty"`
-	Snapshot             tools.Snapshot     `json:"snapshot"`
-	Plan                 *auditPlanDoneArgs `json:"plan,omitempty"`
-	ModeratorSuggestions []string           `json:"moderator_suggestions,omitempty"`
-	Completed            bool               `json:"completed"`
-	ForumCursor          int64              `json:"forum_cursor,omitempty"`
-	ForumPending         string             `json:"forum_pending,omitempty"`
-	AnnouncedName        string             `json:"announced_name,omitempty"`
+	Status                 WorkerStatus       `json:"status"`
+	Assignment             string             `json:"assignment"`
+	Messages               []llm.Message      `json:"messages"`
+	Skills                 []string           `json:"skills,omitempty"`
+	TracePath              string             `json:"trace_path,omitempty"`
+	Snapshot               tools.Snapshot     `json:"snapshot"`
+	Plan                   *auditPlanDoneArgs `json:"plan,omitempty"`
+	ModeratorSuggestions   []string           `json:"moderator_suggestions,omitempty"`
+	Completed              bool               `json:"completed"`
+	ForumCursor            int64              `json:"forum_cursor,omitempty"`
+	ForumPending           string             `json:"forum_pending,omitempty"`
+	AnnouncedName          string             `json:"announced_name,omitempty"`
+	UserBroadcastCursor    int64              `json:"user_broadcast_cursor,omitempty"`
+	UserBroadcastDelivered int64              `json:"user_broadcast_delivered,omitempty"`
 }
 
 type teamSession struct {
@@ -44,6 +46,8 @@ type teamSession struct {
 	PendingAssignments map[string][]string        `json:"pending_assignments,omitempty"`
 	IRC                []IRCMessage               `json:"irc,omitempty"`
 	IRCNextID          int64                      `json:"irc_next_id,omitempty"`
+	Budget             *BudgetStatus              `json:"budget,omitempty"`
+	UserBroadcasts     []userBroadcast            `json:"user_broadcasts,omitempty"`
 }
 
 // Saves immutable worker boundaries, including cursor+pending notification pairs.
@@ -53,6 +57,9 @@ func (t *Team) SaveSession(path string) error {
 	t.ircMu.Lock()
 	t.mu.Lock()
 	s := teamSession{Version: 2, SavedAt: time.Now().Format(time.RFC3339), Workspace: t.registry.Workspace(), Phase: t.phase, Input: t.input, ReconAgents: t.cfg.Agent.ReconAgents, AuditAgents: t.cfg.Agent.AuditAgents}
+	budget := t.budgetStatusLocked()
+	budget.Running = false
+	s.Budget = &budget
 	for _, w := range t.workers {
 		s.Workers = append(s.Workers, w.saved)
 	}
@@ -67,6 +74,7 @@ func (t *Team) SaveSession(path string) error {
 	}
 	s.IRC = append([]IRCMessage(nil), t.ircMessages...)
 	s.IRCNextID = t.ircNextID
+	s.UserBroadcasts = append([]userBroadcast(nil), t.userBroadcasts...)
 	s.Forum, s.ForumNames, s.ForumParticipants = t.board.Checkpoint()
 	for i := range s.Workers {
 		s.Workers[i].Status.Name = s.ForumNames[s.Workers[i].Status.ID]
@@ -136,6 +144,24 @@ func (t *Team) LoadSession(path string) error {
 	}
 	if s.ReconAgents < 1 || s.ReconAgents > 32 || s.AuditAgents < 1 || s.AuditAgents > 32 {
 		return fmt.Errorf("无效的会话团队规模")
+	}
+	for i, broadcast := range s.UserBroadcasts {
+		if broadcast.ID != int64(i)+1 {
+			return fmt.Errorf("invalid user broadcast sequence")
+		}
+		if err := validateUserBroadcast(broadcast.Content); err != nil {
+			return err
+		}
+	}
+	if s.Budget != nil {
+		cfg := t.cfg.Agent
+		cfg.BudgetHours, cfg.BudgetMinutes, cfg.BudgetTokens = s.Budget.Hours, s.Budget.Minutes, s.Budget.TokenLimit
+		if _, err := cfg.BudgetDuration(); err != nil {
+			return err
+		}
+		if s.Budget.UsedTokens < 0 || s.Budget.Elapsed < 0 {
+			return fmt.Errorf("invalid saved audit budget consumption")
+		}
 	}
 	for _, revocation := range s.Revocations {
 		if revocation.Key == "" || revocation.Reason == "" || revocation.Evidence == "" {
@@ -209,6 +235,24 @@ func (t *Team) LoadSession(path string) error {
 		allSaved = append(allSaved, *s.Moderator)
 	}
 	for _, saved := range allSaved {
+		if saved.UserBroadcastCursor < 0 || saved.UserBroadcastCursor > int64(len(s.UserBroadcasts)) || saved.UserBroadcastDelivered < 0 || saved.UserBroadcastDelivered > saved.UserBroadcastCursor {
+			newRegistry.Close()
+			return fmt.Errorf("invalid worker user broadcast cursor")
+		}
+		for _, broadcast := range s.UserBroadcasts[:saved.UserBroadcastCursor] {
+			canonical := broadcastMessage(broadcast)
+			found := false
+			for _, message := range saved.Messages {
+				if message.Role == canonical.Role && message.Content == canonical.Content && message.Type == "" {
+					found = true
+					break
+				}
+			}
+			if !found {
+				newRegistry.Close()
+				return fmt.Errorf("full user broadcast missing from worker history")
+			}
+		}
 		if err := validateNativeHistory(saved.Messages); err != nil {
 			newRegistry.Close()
 			return fmt.Errorf("invalid native history for %s: %w", saved.Status.ID, err)
@@ -267,6 +311,12 @@ func (t *Team) LoadSession(path string) error {
 	t.registry = newRegistry
 	t.cfg.Agent.ReconAgents = s.ReconAgents
 	t.cfg.Agent.AuditAgents = s.AuditAgents
+	t.budget = auditBudget{}
+	if s.Budget != nil {
+		t.cfg.Agent.InfiniteMode = s.Budget.InfiniteMode
+		t.cfg.Agent.BudgetHours, t.cfg.Agent.BudgetMinutes, t.cfg.Agent.BudgetTokens = s.Budget.Hours, s.Budget.Minutes, s.Budget.TokenLimit
+		t.budget.elapsed, t.budget.tokens, t.budget.estimated, t.budget.reason = s.Budget.Elapsed, s.Budget.UsedTokens, s.Budget.Estimated, s.Budget.StopReason
+	}
 	t.phase, t.input, t.handoff = s.Phase, s.Input, ""
 	t.workers = nil
 	t.moderator = nil
@@ -274,6 +324,7 @@ func (t *Team) LoadSession(path string) error {
 	t.pendingAssignments = s.PendingAssignments
 	t.ircMessages = append([]IRCMessage(nil), s.IRC...)
 	t.ircNextID = s.IRCNextID
+	t.userBroadcasts = append([]userBroadcast(nil), s.UserBroadcasts...)
 	t.ircChanged = make(chan struct{})
 	t.resetBoard()
 	_ = t.board.Restore(s.Forum)
@@ -284,6 +335,13 @@ func (t *Team) LoadSession(path string) error {
 	_ = t.board.RestoreParticipants(s.ForumParticipants)
 	for _, saved := range allSaved {
 		a := newWorker(t.cfg, t.prompts, t.client, t.compressClient, t.registry.Fork(), saved.Status.ID, saved.Status.Phase, t.board)
+		a.userBroadcastSource = t.broadcastsAfter
+		a.userBroadcastCursor, a.userBroadcastDelivered = saved.UserBroadcastCursor, saved.UserBroadcastDelivered
+		for _, broadcast := range s.UserBroadcasts {
+			a.userBroadcastMessages = append(a.userBroadcastMessages, broadcastMessage(broadcast))
+			a.userBroadcastVersion = broadcast.ID
+		}
+		a.userBroadcastTokens = estimateTokens(a.userBroadcastMessages)
 		a.onDisconnect = t.modelDisconnected
 		a.announcedName = saved.AnnouncedName
 		count := s.ReconAgents

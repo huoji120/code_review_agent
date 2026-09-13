@@ -164,8 +164,35 @@ func activityClock(value string) string {
 // Pin current team progress above the scrollable operations area. Excess workers
 // remain accessible in that area's scrollback on small screens or large teams.
 func (m Model) leftContent(width, height int) (pinned, lines []string) {
-	pinned = append(pinned, fitLine(m.summary(), width))
-	maxPinned := max(1, (height-5)/2)
+	m.budget = m.runner.BudgetStatus()
+	b := m.budget
+	reviewed := 0
+	for _, file := range m.snapshot.Files {
+		if file.Status == "reviewed" || file.Status == "skipped" {
+			reviewed++
+		}
+	}
+	pinned = append(pinned, fitLine(fmt.Sprintf("覆盖 %d/%d · Todo %d · 漏洞 %d", reviewed, len(m.snapshot.Files), len(m.snapshot.Todos), len(m.snapshot.Findings)), width))
+	mode, timeLimit, tokLimit := "普通", "不限", "不限"
+	if b.InfiniteMode {
+		mode = "无限"
+		if b.Hours > 0 || b.Minutes > 0 {
+			timeLimit = fmt.Sprintf("%dh%dm", b.Hours, b.Minutes)
+		}
+		if b.TokenLimit > 0 {
+			tokLimit = fmt.Sprint(b.TokenLimit)
+		}
+	}
+	pinned = append(pinned, fitLine(fmt.Sprintf("%s · 用时 %s / %s", mode, b.Elapsed.Round(time.Second), timeLimit), width))
+	estimate := ""
+	if b.Estimated {
+		estimate = "≈"
+	}
+	pinned = append(pinned, fitLine(fmt.Sprintf("tokens %s%d / %s", estimate, b.UsedTokens, tokLimit), width))
+	if b.StopReason != "" {
+		pinned = append(pinned, wrapLines(b.StopReason, width)...)
+	}
+	maxPinned := max(1, (height-3-len(pinned))/2)
 	for i, w := range m.workers {
 		activity := w.Activity
 		generation := generationLabel(w.Generation)
@@ -259,6 +286,12 @@ func (m Model) forumContent(width int) []string {
 		}
 		if expanded {
 			state = "[-]"
+		}
+		if post.Root.Pinned {
+			topic = "[置顶] " + topic
+		}
+		if post.Root.Closed {
+			topic = "[关闭] " + topic
 		}
 		start := len(lines)
 		lines = append(lines, wrapLines(fmt.Sprintf("%s %s 帖子 #%d  %s", marker, state, post.ID, topic), width)...)

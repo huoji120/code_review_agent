@@ -8,7 +8,7 @@ import (
 
 const closeConsensusTimeout = 180 * time.Second
 
-const continueAuditWork = "关闭尚未获准；继续帮助其他 Agent 复核、检查尚未覆盖或原分工之外的代码、收集证据，不要重复等待或刷关闭投票。"
+const continueAuditWork = "关闭尚未获准；继续自己的审计：自行选择尚未覆盖的其他文件、入口或模块，建立具体待办并读取源码、追踪新的调用链。不要等待或催促其他成员，不要反复请求关闭，也不要围绕其他 Agent 的已有结论重复复核来消磨时间；没有新的独立审计进展，不重复提交同一关闭请求。"
 
 type CloseDecision struct {
 	Status    string    `json:"status"`

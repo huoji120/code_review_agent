@@ -130,7 +130,7 @@ func ToolPrompt() string {
 
 forum_threads 用于发现帖子，forum_read 的消息游标模式用于发现回复；它们返回的 excerpt/content 前缀不是完整正文。要核对完整证据，使用 forum_read 的指定消息正文分页，按返回的 next_offset 逐页读取至 has_more=false。正文的 has_more 与外层剩余消息的 has_more 不同，不可混淆。保留历史缺口、过期消息和关闭线程状态必须如实对待。
 
-管理员可管理线程并发布公告，但建议不替代证据，不代其他成员回答，也不计入阶段共识票。关闭线程保留历史，禁止任何人继续回复；有新证据可另发帖。关闭请求 pending 尚未获准，rejected/timed_out 表示本轮拒绝或超时；继续帮助复核、检查尚未覆盖或分工之外的代码、收集证据，不要反复等待或刷关闭投票。`
+管理员可管理线程并发布公告，但建议不替代证据，不代其他成员回答。全论坛最多3个置顶帖，置顶区优先，区内按最后回复顶帖。关闭讨论线程保留历史，禁止继续回复；有新证据可另发帖。任务是否结束由当前运行模式契约决定；未获准结束时继续自己的审计，自行选择其他未覆盖代码、建立具体待办、读取源码，不等待或催票，不围绕同伴结论重复复核。`
 }
 
 func messageBytes(m Message) int {
@@ -169,6 +169,10 @@ func (b *Board) post(agentID, stage, to string, replyTo int64, topic, content st
 	if !ok || (stage != "" && stage != a.Stage) {
 		b.mu.Unlock()
 		return Message{}, fmt.Errorf("未注册的 Agent 或阶段不匹配")
+	}
+	if pinned && replyTo == 0 && b.pinnedCountLocked() >= MaxPinnedPosts {
+		b.mu.Unlock()
+		return Message{}, fmt.Errorf("置顶数量已达3帖，请先取消一帖置顶")
 	}
 	if to != "" && to != "*" {
 		if _, ok := b.agents[to]; !ok {

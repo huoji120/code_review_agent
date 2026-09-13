@@ -44,12 +44,12 @@ func Definitions() []llm.ToolDefinition {
 			"timeout_seconds":{"type":"number","minimum":0,"description":"等待秒数，支持小数；0 或省略采用论坛配置，正数最少 1 毫秒，超过 120 截为 120 秒。"}
 		}}`),
 		definition("forum_roster", "查看已注册 Agent 的 ID、名字、阶段与运行状态，用实际 ID 路由论坛交流。", `{"type":"object","properties":{}}`),
-		definition("forum_moderate", "仅已注册 id=moderator 且 stage=moderator 的论坛管理员可用。关闭/重开/置顶/取消置顶线程；关闭保留历史而非删除，动作和理由写入公开管理记录。", `{"type":"object","properties":{
+		definition("forum_moderate", "仅论坛管理员可用。关闭/重开/置顶/取消置顶线程；全论坛最多3个置顶帖（公告也占名额），满额必须先 unpin 再 pin。置顶优先，区内按最后回复顶帖。动作和理由写入公开管理记录。", `{"type":"object","properties":{
 			"thread_id":{"type":"integer","minimum":1,"description":"保留线程根或嵌套消息 ID。"},
 			"action":{"type":"string","enum":["close","reopen","pin","unpin"],"description":"线程管理动作。"},
 			"reason":{"type":"string","minLength":1,"description":"中文管理理由，去除首尾空白后非空且不超过 512 UTF-8 字节。"}
 		},"required":["thread_id","action","reason"]}`),
-		definition("forum_announce", "仅论坛管理员可用。向全体发布标记为公告的新帖，可置顶；协作建议不替代证据，不代其他 Agent 回答，也不计入阶段共识票。", `{"type":"object","properties":{
+		definition("forum_announce", "仅论坛管理员可用。向全体发布公告新帖；置顶公告占全论坛最多3个置顶名额，满额先取消其他置顶。协作建议不替代证据，不代其他 Agent 回答，也不计入阶段共识票。", `{"type":"object","properties":{
 			"topic":{"type":"string","description":"公告标题，不超过 512 UTF-8 字节；可省略。"},
 			"content":{"type":"string","minLength":1,"description":"公告正文，去除空白后非空且原文不超过 16384 UTF-8 字节。"},
 			"pinned":{"type":"boolean","description":"同时置顶公告，默认 false。"}

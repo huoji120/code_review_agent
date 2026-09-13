@@ -101,9 +101,19 @@ type OpenAIClient struct {
 	httpClient *http.Client
 }
 
-func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, emit func(Delta) error) error {
+func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, emit func(Delta) error) (resultErr error) {
 	if c.cfg.APIKey == "" {
 		return fmt.Errorf("missing API key; set openai.api_key directly, or set openai.api_key_env to an environment variable name")
+	}
+	ctx, usage := beginUsage(ctx, messages, nil)
+	defer func() {
+		usage.finish()
+		if usage != nil && resultErr == nil {
+			resultErr = context.Cause(usage.ctx)
+		}
+	}()
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
 	}
 	if c.useResponsesAPI() {
 		return c.responsesStream(ctx, messages, emit)
@@ -115,6 +125,9 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, emit 
 		TopP:        c.cfg.TopP,
 		MaxTokens:   c.cfg.MaxOutputTokens,
 		Stream:      true,
+	}
+	if usage != nil {
+		reqBody.StreamOptions = &chatStreamOptions{IncludeUsage: true}
 	}
 	data, err := json.Marshal(reqBody)
 	if err != nil {
@@ -143,7 +156,7 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, emit 
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), responseWireLimit(nativeTextLimit(c.cfg.MaxOutputTokens)))
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return context.Cause(ctx)
@@ -161,10 +174,15 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, emit 
 		}
 		var chunk streamResponse
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			_ = usage.add(len(payload))
 			return err
 		}
+		usage.supplied(chunk.Usage)
 		for _, choice := range chunk.Choices {
 			delta := Delta{Content: choice.Delta.Content, Thinking: firstNonEmpty(choice.Delta.ReasoningContent, choice.Delta.Reasoning, choice.Delta.ReasoningText)}
+			if err := usage.chat(choice.Delta); err != nil {
+				return err
+			}
 			if delta.Content == "" && delta.Thinking == "" {
 				continue
 			}
@@ -292,7 +310,7 @@ func (b *streamBody) Close() error {
 	return b.ReadCloser.Close()
 }
 
-func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (string, error) {
+func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (result string, resultErr error) {
 	if c.cfg.Stream {
 		var thinking strings.Builder
 		var content strings.Builder
@@ -308,6 +326,16 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (string, er
 	}
 	if c.cfg.APIKey == "" {
 		return "", fmt.Errorf("missing API key; set openai.api_key directly, or set openai.api_key_env to an environment variable name")
+	}
+	ctx, usage := beginUsage(ctx, messages, nil)
+	defer func() {
+		usage.finish()
+		if usage != nil && resultErr == nil && usage.ctx.Err() != nil {
+			result, resultErr = "", context.Cause(usage.ctx)
+		}
+	}()
+	if ctx.Err() != nil {
+		return "", context.Cause(ctx)
 	}
 	if c.useResponsesAPI() {
 		return c.responsesChat(ctx, messages)
@@ -337,6 +365,7 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (string, er
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
+	accountUnreadableBody(ctx, body, err)
 	if err != nil {
 		return "", err
 	}
@@ -347,6 +376,15 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (string, er
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return "", err
 	}
+	usage.supplied(parsed.Usage)
+	if usage != nil {
+		for _, choice := range parsed.Choices {
+			msg := choice.Message
+			if err := usage.chat(msg); err != nil {
+				return "", err
+			}
+		}
+	}
 	if len(parsed.Choices) == 0 {
 		return "", fmt.Errorf("openai returned no choices")
 	}
@@ -356,9 +394,22 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (string, er
 
 // ChatTools uses the provider's native function-call protocol. Tool calls are
 // collected but never inferred from text/reasoning channels.
-func (c *OpenAIClient) ChatTools(ctx context.Context, messages []Message, tools []ToolDefinition, emit func(Delta) error) (ToolResponse, error) {
+func (c *OpenAIClient) ChatTools(ctx context.Context, messages []Message, tools []ToolDefinition, emit func(Delta) error) (result ToolResponse, resultErr error) {
 	if c.cfg.APIKey == "" {
 		return ToolResponse{}, fmt.Errorf("missing API key")
+	}
+	if err := validateToolHistory(messages); err != nil {
+		return ToolResponse{}, err
+	}
+	ctx, usage := beginUsage(ctx, messages, tools)
+	defer func() {
+		usage.finish()
+		if usage != nil && resultErr == nil && usage.ctx.Err() != nil {
+			result, resultErr = ToolResponse{}, context.Cause(usage.ctx)
+		}
+	}()
+	if ctx.Err() != nil {
+		return ToolResponse{}, context.Cause(ctx)
 	}
 	if c.useResponsesAPI() {
 		return c.responsesTools(ctx, messages, tools, emit)
@@ -403,7 +454,7 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 	// Track only emitted part identities, never a second copy of generated text.
 	seen := make(map[responsesPart]bool)
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), responsesMaxBytes)
+	scanner.Buffer(make([]byte, 0, 64*1024), responseWireLimit(nativeTextLimit(c.cfg.MaxOutputTokens)))
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return context.Cause(ctx)
@@ -418,7 +469,11 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 		}
 		var chunk responsesStreamEvent
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			_ = usageFor(ctx).add(len(payload))
 			return fmt.Errorf("openai responses event: %w", err)
+		}
+		if err := usageFor(ctx).event(chunk); err != nil {
+			return err
 		}
 		var delta Delta
 		part := responsesPart{Output: chunk.OutputIndex, Index: chunk.ContentIndex}
@@ -504,6 +559,7 @@ func (c *OpenAIClient) responsesChat(ctx context.Context, messages []Message) (s
 	}
 	defer resp.Body.Close()
 	body, err := readResponsesBody(resp.Body)
+	accountUnreadableBody(ctx, body, err)
 	if err != nil {
 		return "", err
 	}
@@ -512,6 +568,9 @@ func (c *OpenAIClient) responsesChat(ctx context.Context, messages []Message) (s
 	}
 	var parsed responsesResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", err
+	}
+	if err := usageFor(ctx).response(parsed); err != nil {
 		return "", err
 	}
 	if err := parsed.completed(); err != nil {
@@ -563,12 +622,17 @@ func firstNonEmpty(values ...string) string {
 }
 
 type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature"`
-	TopP        float64   `json:"top_p"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Stream      bool      `json:"stream,omitempty"`
+	Model         string             `json:"model"`
+	Messages      []Message          `json:"messages"`
+	Temperature   float64            `json:"temperature"`
+	TopP          float64            `json:"top_p"`
+	MaxTokens     int                `json:"max_tokens,omitempty"`
+	Stream        bool               `json:"stream,omitempty"`
+	StreamOptions *chatStreamOptions `json:"stream_options,omitempty"`
+}
+
+type chatStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatResponse struct {
@@ -632,10 +696,10 @@ const responsesMaxBytes = 1024 * 1024
 func readResponsesBody(body io.Reader) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(body, responsesMaxBytes+1))
 	if err != nil {
-		return nil, err
+		return data, err
 	}
 	if len(data) > responsesMaxBytes {
-		return nil, fmt.Errorf("openai responses: response body exceeds %d bytes", responsesMaxBytes)
+		return data, fmt.Errorf("openai responses: response body exceeds %d bytes", responsesMaxBytes)
 	}
 	return data, nil
 }

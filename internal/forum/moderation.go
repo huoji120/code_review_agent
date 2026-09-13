@@ -8,6 +8,34 @@ import (
 
 const maxModerationReason = 512
 
+const MaxPinnedPosts = 3
+
+// Replies mirror their root's pin state; count threads, not messages.
+func (b *Board) pinnedCountLocked() int {
+	var ids [MaxPinnedPosts]int64
+	count := 0
+	for _, m := range b.msgs {
+		if !m.Pinned {
+			continue
+		}
+		seen := false
+		for _, id := range ids[:count] {
+			if id == m.ThreadID {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			if count == MaxPinnedPosts {
+				return count
+			}
+			ids[count] = m.ThreadID
+			count++
+		}
+	}
+	return count
+}
+
 func copyModeration(dst *Message, src Message) {
 	dst.Closed = src.Closed
 	dst.Pinned = src.Pinned
@@ -61,6 +89,15 @@ func validateRestoredMessages(messages []Message) ([]Message, int64, error) {
 		normalized = append(normalized, m)
 		previous = m.ID
 	}
+	pinned := 0
+	for _, state := range states {
+		if state.Pinned {
+			pinned++
+		}
+	}
+	if pinned > MaxPinnedPosts {
+		return nil, 0, fmt.Errorf("论坛会话置顶超过3帖；请先取消多余置顶")
+	}
 	return normalized, previous, nil
 }
 
@@ -109,6 +146,10 @@ func (b *Board) moderatorCall(id, stage, name string, raw json.RawMessage) strin
 	if state.ID == 0 {
 		b.mu.Unlock()
 		return failure("线程不存在或已淘汰")
+	}
+	if args.Action == "pin" && !state.Pinned && b.pinnedCountLocked() >= MaxPinnedPosts {
+		b.mu.Unlock()
+		return failure("置顶数量已达3帖，请先 unpin 一帖再置顶；本次未修改")
 	}
 	switch args.Action {
 	case "close":

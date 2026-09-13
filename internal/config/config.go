@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -54,6 +55,23 @@ type AgentConfig struct {
 	ForumWaitSeconds         int     `yaml:"forum_wait_seconds"`
 	ModeratorEnabled         *bool   `yaml:"moderator_enabled"`
 	ModeratorIntervalSeconds int     `yaml:"moderator_interval_seconds"`
+	InfiniteMode             bool    `yaml:"infinite_mode"`
+	BudgetHours              int     `yaml:"budget_hours"`
+	BudgetMinutes            int     `yaml:"budget_minutes"`
+	BudgetTokens             int64   `yaml:"budget_tokens"`
+}
+
+// BudgetDuration keeps explicit zero as unlimited and rejects overflow before
+// converting user-supplied hours/minutes to a timer duration.
+func (cfg AgentConfig) BudgetDuration() (time.Duration, error) {
+	const maxMinutes = int64(math.MaxInt64) / int64(time.Minute)
+	if cfg.BudgetHours < 0 || cfg.BudgetMinutes < 0 || cfg.BudgetTokens < 0 {
+		return 0, fmt.Errorf("audit budgets must be nonnegative; 0 means unlimited")
+	}
+	if int64(cfg.BudgetMinutes) > maxMinutes || int64(cfg.BudgetHours) > (maxMinutes-int64(cfg.BudgetMinutes))/60 {
+		return 0, fmt.Errorf("audit time budget overflows time.Duration")
+	}
+	return time.Duration(int64(cfg.BudgetHours)*60+int64(cfg.BudgetMinutes)) * time.Minute, nil
 }
 
 func Load(path string) (Config, error) {
@@ -64,7 +82,7 @@ func Load(path string) (Config, error) {
 	// Seed required defaults before decoding so explicit zero remains invalid.
 	cfg := Config{
 		OpenAI: OpenAIConfig{MaxContextTokens: 32000, MaxOutputTokens: 4096},
-		Agent:  AgentConfig{CompressAtRatio: 0.75},
+		Agent:  AgentConfig{CompressAtRatio: 0.75, BudgetHours: 8},
 	}
 	var document yaml.Node
 	if err := yaml.Unmarshal(data, &document); err != nil {
@@ -91,6 +109,9 @@ func Load(path string) (Config, error) {
 		}
 	}
 	applyDefaults(&cfg)
+	if _, err := cfg.Agent.BudgetDuration(); err != nil {
+		return Config{}, err
+	}
 	if cfg.Agent.ReconAgents < 1 || cfg.Agent.ReconAgents > 666 || cfg.Agent.AuditAgents < 1 || cfg.Agent.AuditAgents > 666 {
 		return Config{}, fmt.Errorf("agent.recon_agents and agent.audit_agents must be between 1 and 666")
 	}

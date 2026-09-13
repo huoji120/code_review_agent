@@ -13,6 +13,9 @@ import (
 )
 
 func validCall(call FunctionCall) error {
+	if len(call.Arguments) > responsesMaxBytes || len(call.Name) > responsesMaxBytes-len(call.Arguments) {
+		return &ToolProtocolError{Kind: "function arguments too large"}
+	}
 	if strings.TrimSpace(call.CallID) == "" {
 		return &ToolProtocolError{Kind: "missing call_id"}
 	}
@@ -160,11 +163,17 @@ func (c *OpenAIClient) nativeRequest(ctx context.Context, path string, payload a
 type toolText struct {
 	content, thinking strings.Builder
 	emit              func(Delta) error
+	limit             int
 }
 
 func (s *toolText) add(delta Delta) error {
-	if s.content.Len()+s.thinking.Len()+len(delta.Content)+len(delta.Thinking) > responsesMaxBytes {
-		return fmt.Errorf("openai native text exceeds %d bytes", responsesMaxBytes)
+	limit := s.limit
+	if limit < responsesMaxBytes {
+		limit = responsesMaxBytes
+	}
+	remaining := limit - s.content.Len() - s.thinking.Len()
+	if len(delta.Content) > remaining || len(delta.Thinking) > remaining-len(delta.Content) {
+		return fmt.Errorf("openai native text exceeds %d bytes", limit)
 	}
 	s.content.WriteString(delta.Content)
 	s.thinking.WriteString(delta.Thinking)
@@ -177,10 +186,46 @@ func (s *toolText) result(calls []FunctionCall) ToolResponse {
 	return ToolResponse{Content: s.content.String(), Thinking: s.thinking.String(), Calls: calls}
 }
 
-func (c *OpenAIClient) responsesTools(ctx context.Context, messages []Message, tools []ToolDefinition, emit func(Delta) error) (ToolResponse, error) {
-	if err := validateToolHistory(messages); err != nil {
-		return ToolResponse{}, err
+// Keep individual SSE frames and tool arguments bounded separately. Text may
+// span many frames; allow generous UTF-8 headroom for the configured generation.
+func nativeTextLimit(tokens int) int {
+	maxInt := int(^uint(0) >> 1)
+	if tokens > maxInt/16 {
+		return maxInt
 	}
+	if tokens <= responsesMaxBytes/16 {
+		return responsesMaxBytes
+	}
+	return tokens * 16
+}
+
+func responseWireLimit(textLimit int) int {
+	// JSON may escape every byte as six characters. Keep wire overhead bounded
+	// independently and retain the decoded text/argument checks after parsing.
+	if textLimit < responsesMaxBytes {
+		textLimit = responsesMaxBytes
+	}
+	maxInt := int(^uint(0) >> 1)
+	limit := maxInt - 1
+	if textLimit <= (maxInt-1-responsesMaxBytes)/6 {
+		limit = textLimit*6 + responsesMaxBytes
+	}
+	return limit
+}
+
+func readNativeBody(body io.Reader, textLimit int) ([]byte, error) {
+	limit := responseWireLimit(textLimit)
+	data, err := io.ReadAll(io.LimitReader(body, int64(limit)+1))
+	if err != nil {
+		return data, err
+	}
+	if len(data) > limit {
+		return data, fmt.Errorf("openai native response body exceeds %d bytes", limit)
+	}
+	return data, nil
+}
+
+func (c *OpenAIClient) responsesTools(ctx context.Context, messages []Message, tools []ToolDefinition, emit func(Delta) error) (ToolResponse, error) {
 	payload := struct {
 		Model             string           `json:"model"`
 		Input             []any            `json:"input"`
@@ -196,6 +241,7 @@ func (c *OpenAIClient) responsesTools(ctx context.Context, messages []Message, t
 		return ToolResponse{}, err
 	}
 	defer progress.flushPending()
+	progress.textLimit = nativeTextLimit(c.cfg.MaxOutputTokens)
 	resp, ctx, err := c.nativeRequest(ctx, "/responses", payload)
 	if err != nil {
 		return ToolResponse{}, err
@@ -204,7 +250,8 @@ func (c *OpenAIClient) responsesTools(ctx context.Context, messages []Message, t
 	if c.cfg.Stream {
 		return consumeNativeResponses(ctx, resp.Body, progress)
 	}
-	body, err := readResponsesBody(resp.Body)
+	body, err := readNativeBody(resp.Body, progress.textLimit)
+	accountUnreadableBody(ctx, body, err)
 	if err != nil {
 		return ToolResponse{}, err
 	}
@@ -212,10 +259,13 @@ func (c *OpenAIClient) responsesTools(ctx context.Context, messages []Message, t
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return ToolResponse{}, &ToolProtocolError{Kind: "invalid Responses response", Err: err}
 	}
+	if err := usageFor(ctx).response(parsed); err != nil {
+		return ToolResponse{}, err
+	}
 	if err := parsed.completed(); err != nil {
 		return ToolResponse{}, err
 	}
-	text := toolText{emit: progress.text}
+	text := toolText{emit: progress.text, limit: progress.textLimit}
 	if err := parsed.eachText(func(_ responsesPart, d Delta) error { return text.add(d) }); err != nil {
 		return ToolResponse{}, err
 	}
@@ -288,7 +338,7 @@ func readNativeResponses(ctx context.Context, body io.Reader, emit func(Delta) e
 }
 
 func consumeNativeResponses(ctx context.Context, body io.Reader, progress *generationTracker) (ToolResponse, error) {
-	text := toolText{emit: progress.text}
+	text := toolText{emit: progress.text, limit: progress.textLimit}
 	seen := map[responsesPart]*strings.Builder{}
 	addPart := func(part responsesPart, d Delta, snapshot bool) error {
 		value := d.Content
@@ -328,7 +378,7 @@ func consumeNativeResponses(ctx context.Context, body io.Reader, progress *gener
 		return state, nil
 	}
 	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), responsesMaxBytes)
+	scanner.Buffer(make([]byte, 0, 64*1024), responseWireLimit(progress.textLimit))
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return ToolResponse{}, context.Cause(ctx)
@@ -343,7 +393,11 @@ func consumeNativeResponses(ctx context.Context, body io.Reader, progress *gener
 		}
 		var event responsesStreamEvent
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			_ = usageFor(ctx).add(len(payload))
 			return ToolResponse{}, &ToolProtocolError{Kind: "invalid Responses event", Err: err}
+		}
+		if err := usageFor(ctx).event(event); err != nil {
+			return ToolResponse{}, err
 		}
 		switch event.Type {
 		case "response.output_text.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta", "response.output_text.done", "response.reasoning_text.done", "response.reasoning_summary_text.done":
@@ -488,28 +542,30 @@ func consumeNativeResponses(ctx context.Context, body io.Reader, progress *gener
 }
 
 func (c *OpenAIClient) chatCompletionsTools(ctx context.Context, messages []Message, tools []ToolDefinition, emit func(Delta) error) (ToolResponse, error) {
-	if err := validateToolHistory(messages); err != nil {
-		return ToolResponse{}, err
-	}
 	nativeTools := make([]any, 0, len(tools))
 	for _, tool := range tools {
 		nativeTools = append(nativeTools, map[string]any{"type": "function", "function": map[string]any{"name": tool.Name, "description": tool.Description, "parameters": tool.Parameters, "strict": tool.Strict}})
 	}
 	payload := struct {
-		Model             string  `json:"model"`
-		Messages          []any   `json:"messages"`
-		Tools             []any   `json:"tools"`
-		ParallelToolCalls bool    `json:"parallel_tool_calls"`
-		Temperature       float64 `json:"temperature"`
-		TopP              float64 `json:"top_p"`
-		MaxTokens         int     `json:"max_tokens,omitempty"`
-		Stream            bool    `json:"stream"`
-	}{c.cfg.Model, nativeChatInput(messages), nativeTools, false, c.cfg.Temperature, c.cfg.TopP, c.cfg.MaxOutputTokens, c.cfg.Stream}
+		Model             string             `json:"model"`
+		Messages          []any              `json:"messages"`
+		Tools             []any              `json:"tools"`
+		ParallelToolCalls bool               `json:"parallel_tool_calls"`
+		Temperature       float64            `json:"temperature"`
+		TopP              float64            `json:"top_p"`
+		MaxTokens         int                `json:"max_tokens,omitempty"`
+		Stream            bool               `json:"stream"`
+		StreamOptions     *chatStreamOptions `json:"stream_options,omitempty"`
+	}{c.cfg.Model, nativeChatInput(messages), nativeTools, false, c.cfg.Temperature, c.cfg.TopP, c.cfg.MaxOutputTokens, c.cfg.Stream, nil}
+	if c.cfg.Stream && usageFor(ctx) != nil {
+		payload.StreamOptions = &chatStreamOptions{IncludeUsage: true}
+	}
 	progress, err := newGenerationTracker(ctx, emit)
 	if err != nil {
 		return ToolResponse{}, err
 	}
 	defer progress.flushPending()
+	progress.textLimit = nativeTextLimit(c.cfg.MaxOutputTokens)
 	resp, ctx, err := c.nativeRequest(ctx, "/chat/completions", payload)
 	if err != nil {
 		return ToolResponse{}, err
@@ -518,13 +574,22 @@ func (c *OpenAIClient) chatCompletionsTools(ctx context.Context, messages []Mess
 	if c.cfg.Stream {
 		return consumeNativeChat(ctx, resp.Body, progress)
 	}
-	body, err := readResponsesBody(resp.Body)
+	body, err := readNativeBody(resp.Body, progress.textLimit)
+	accountUnreadableBody(ctx, body, err)
 	if err != nil {
 		return ToolResponse{}, err
 	}
 	var parsed chatResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return ToolResponse{}, &ToolProtocolError{Kind: "invalid chat response", Err: err}
+	}
+	if usage := usageFor(ctx); usage != nil {
+		usage.supplied(parsed.Usage)
+		for _, choice := range parsed.Choices {
+			if err := usage.chat(choice.Message); err != nil {
+				return ToolResponse{}, err
+			}
+		}
 	}
 	if parsed.Error.Message != "" || parsed.Error.Code != "" {
 		return ToolResponse{}, fmt.Errorf("openai native chat error: %s", firstNonEmpty(parsed.Error.Message, parsed.Error.Code))
@@ -536,7 +601,7 @@ func (c *OpenAIClient) chatCompletionsTools(ctx context.Context, messages []Mess
 	if choice.FinishReason != "stop" && choice.FinishReason != "tool_calls" {
 		return ToolResponse{}, fmt.Errorf("openai native chat did not complete: %s", choice.FinishReason)
 	}
-	text := toolText{emit: progress.text}
+	text := toolText{emit: progress.text, limit: progress.textLimit}
 	if err := text.add(Delta{Content: choice.Message.Content, Thinking: firstNonEmpty(choice.Message.ReasoningContent, choice.Message.Reasoning, choice.Message.ReasoningText)}); err != nil {
 		return ToolResponse{}, err
 	}
@@ -572,7 +637,7 @@ func readNativeChat(ctx context.Context, body io.Reader, emit func(Delta) error)
 }
 
 func consumeNativeChat(ctx context.Context, body io.Reader, progress *generationTracker) (ToolResponse, error) {
-	text := toolText{emit: progress.text}
+	text := toolText{emit: progress.text, limit: progress.textLimit}
 	type chatCallState struct {
 		id         string
 		name, args strings.Builder
@@ -581,7 +646,7 @@ func consumeNativeChat(ctx context.Context, body io.Reader, progress *generation
 	finish := ""
 	var usage *generationUsage
 	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), responsesMaxBytes)
+	scanner.Buffer(make([]byte, 0, 64*1024), responseWireLimit(progress.textLimit))
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return ToolResponse{}, context.Cause(ctx)
@@ -618,7 +683,16 @@ func consumeNativeChat(ctx context.Context, body io.Reader, progress *generation
 		}
 		var chunk streamResponse
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			_ = usageFor(ctx).add(len(payload))
 			return ToolResponse{}, &ToolProtocolError{Kind: "invalid chat event", Err: err}
+		}
+		if usage := usageFor(ctx); usage != nil {
+			usage.supplied(chunk.Usage)
+			for _, choice := range chunk.Choices {
+				if err := usage.chat(choice.Delta); err != nil {
+					return ToolResponse{}, err
+				}
+			}
 		}
 		if chunk.Error.Message != "" || chunk.Error.Code != "" {
 			return ToolResponse{}, fmt.Errorf("openai native chat error: %s", firstNonEmpty(chunk.Error.Message, chunk.Error.Code))

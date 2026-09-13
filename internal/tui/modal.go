@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -24,6 +25,36 @@ type modalState struct {
 	err       string
 	findings  *findingsModal
 	agents    bool
+	budget    bool
+}
+
+func (m *Model) openBudgetPrompt() tea.Cmd {
+	if m.busy || m.saving {
+		m.pendingDir = ""
+		m.addEvent("请先停止审计并等待保存完成，再修改预算。")
+		return nil
+	}
+	m.budgetCfg = m.runner.BudgetStatus()
+	editor := textarea.New()
+	editor.Prompt = ""
+	editor.Placeholder = "normal|infinite hours minutes tokens"
+	editor.ShowLineNumbers = false
+	editor.EndOfBufferCharacter = ' '
+	editor.MaxHeight = 0
+	editor.CharLimit = 256
+	mode := "normal"
+	if m.budgetCfg.InfiniteMode {
+		mode = "infinite"
+	}
+	tokens := "0"
+	if m.budgetCfg.TokenLimit > 0 {
+		tokens = fmt.Sprint(m.budgetCfg.TokenLimit)
+	}
+	editor.SetValue(fmt.Sprintf("%s %d %d %s", mode, m.budgetCfg.Hours, m.budgetCfg.Minutes, tokens))
+	m.modal = &modalState{title: "审计预算", compose: true, budget: true, editor: editor}
+	m.input.Blur()
+	m.resizeModal()
+	return m.modal.editor.Focus()
 }
 
 func (m *Model) openBroadcast(value string) tea.Cmd {
@@ -103,6 +134,7 @@ func (m *Model) updateModal(msg tea.Msg) tea.Cmd {
 				m.returnToFindings()
 				return nil
 			}
+			m.pendingDir = ""
 			return m.closeModal()
 		case "ctrl+c":
 			cmd, _ := m.handleKey(key)
@@ -110,14 +142,41 @@ func (m *Model) updateModal(msg tea.Msg) tea.Cmd {
 		case "ctrl+s":
 			if state.compose {
 				value := state.editor.Value()
+				if state.budget {
+					p := strings.Fields(value)
+					if len(p) != 4 || (p[0] != "normal" && p[0] != "infinite") {
+						state.err = "格式：normal|infinite 小时 分钟 tokens"
+						return nil
+					}
+					h, e1 := strconv.Atoi(p[1])
+					mi, e2 := strconv.Atoi(p[2])
+					tok, e3 := strconv.ParseInt(p[3], 10, 64)
+					if e1 != nil || e2 != nil || e3 != nil || h < 0 || mi < 0 || tok < 0 {
+						state.err = "预算必须是非负整数，0表示不限"
+						return nil
+					}
+					if err := m.runner.ConfigureBudget(p[0] == "infinite", h, mi, tok); err != nil {
+						state.err = err.Error()
+						return nil
+					}
+					m.budgetCfg = m.runner.BudgetStatus()
+					dir := m.pendingDir
+					m.pendingDir = ""
+					cmd := m.closeModal()
+					if dir != "" {
+						return m.startDirectory(dir)
+					}
+					return cmd
+				}
 				if len(value) > maxBroadcastBytes || strings.TrimSpace(value) == "" {
-					state.err = "消息必须非空且不超过 16 KiB。"
+					state.err = "消息必须非空且不超过16 KiB"
 					return nil
 				}
 				if err := m.runner.PostMessage(value); err != nil {
-					state.err = "发送失败：" + err.Error()
+					state.err = err.Error()
 					return nil
 				}
+				m.addAgentEvent("user", "用户广播了："+value+"（完整正文将在各 Agent 下一轮优先读取）")
 				m.refreshForumPage()
 				return m.closeModal()
 			}
@@ -130,11 +189,10 @@ func (m *Model) updateModal(msg tea.Msg) tea.Cmd {
 		before := state.editor.Value()
 		var cmd tea.Cmd
 		state.editor, cmd = state.editor.Update(msg)
-		after := state.editor.Value()
-		if len(after) > maxBroadcastBytes {
+		if len(state.editor.Value()) > maxBroadcastBytes {
 			state.editor.SetValue(before)
-			state.err = "输入超过 16 KiB；已保留修改前的草稿。"
-		} else if after != before {
+			state.err = "输入超过16 KiB"
+		} else if state.editor.Value() != before {
 			state.err = ""
 		}
 		return cmd
@@ -224,10 +282,16 @@ func (m Model) overlayModal(frame string) string {
 	if m.modal.compose {
 		content = strings.Split(m.modal.editor.View(), "\n")
 		status = fmt.Sprintf("%d / %d bytes", len(m.modal.editor.Value()), maxBroadcastBytes)
+		if m.modal.budget {
+			status = "normal|infinite 小时 分钟 tokens；0不限；时间/token 任一耗尽即停"
+		}
 		if m.modal.err != "" {
 			status = m.modal.err
 		}
 		footer = "Ctrl+S 发送 · Enter 换行 · Esc 取消"
+		if m.modal.budget {
+			footer = "Ctrl+S 确认预算 · Esc 取消（不启动）"
+		}
 	} else {
 		m.wrapModal(inner)
 		content = viewport(m.modal.wrapped, m.modal.scroll, bodyHeight, false)
