@@ -5,7 +5,7 @@ openai:
   base_url: https://api.deepseek.com/v1
   api_key: sk-xxxxxxx
   model: deepseek-v4-flash
-  temperature: 0.8
+  temperature: 1
   top_p: 1
   max_context_tokens: 1048576
   max_output_tokens: 393216
