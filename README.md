@@ -106,39 +106,6 @@ infinite 8 0 0
 
 停止状态下输入 **`/budget`** 可切换模式、调整预算；配置文件负责启动默认值，界面修改保存在会话中，不回写 YAML。运行中在对话框外**连续按两次 Esc** 确认暂停，等待成员完全停止后输入 **`go`** 继续。
 
-## 示例漏洞列表(仅娱乐,让K3验证我自己没看过是不是真的)
-### V8 riscv JS→Wasm wrapper ==1
-riscv JS→Wasm wrapper ==1 vs 位测试 — ✅ 真的，证据很硬
-
-对照同目录 x64（L458-459）和 arm64（L592-593）的同函数同位置：
-
-```cpp
-// x64:   testl(valuetype, 1); j(equal, &convert_param)     ← 位测试
-// arm64: Tst(valuetype, 1);  B(&convert_param, eq)        ← 位测试
-// riscv: Branch(&convert_param, eq, valuetype, Operand(1)) ← 等值比较
-```
-
-- ValueType 编码（value-type.h:229）TypeKindField 在低 2 位，bit0 区分数值/引用：上游用 Tst(valuetype, 1)，bit0=0（数值）→ 转换，bit0=1（引用）→ 直接存。
-- riscv 改成 == 1：只有 raw 值恰为 1 的单一编码进 convert_param；所有 i64/f32/f64 数值参数（raw 为偶数 ≠ 1）全部掉进 handle_ref_param，不做转换直接把 tagged JS 值按引用类型存进 64 位槽 → wasm
-  侧把指针位模式当数值用 / GC 把数值位模式当指针扫描，JS↔Wasm 双向类型混淆。返回值方向 L825 Branch(&return_kWasmRef, ne, valuetype, Operand(1)) 是同款错误的第二处。
-- 最讽刺的是 riscv L598 保留了上游注释"kRefNull is not representable as a cmp Operand"——注释在说"没法用等值比较"，下一行却正是等值比较。移植时改坏的（或注入的），与上游语义明确偏离。
-
-但暴露面：此文件需要 riscv64 架构 + V8_ENABLE_WASM_INTERPRETER（Drumbrake）双重门控，Chrome/Node 出货构建都不含。对真实用户≈零暴露；作为代码缺陷它是这批里最扎实的一个——如果该工作区是"找注入
-bug"的靶场，这条值得算真发现，"high" 在该架构配置下名副其实，跨平台意义上则无人可达。
-
-### V8 ValueDeserializer::ReadSharedObject 越界读
-`ValueDeserializer::ReadSharedObject()` 从不可信序列化字节流中读取攻击者可控的 32 位 `shared_object_id`，**未做任何范围校验**直接索引 `SharedObjectConveyorHandles` 内部的 `std::vector<Handle<HeapObject>>`，唯一的检查是 release 构建下会被编译掉的 `DCHECK`。
-
-| # | 条件 | 说明 |
-|---|------|------|
-| 1 | 嵌入方实现 `ValueDeserializer::Delegate::GetSharedValueConveyor` 并返回非空 conveyor | 无 delegate 时 `ReadSharedObject` 在 value-serializer.cc:2530 直接抛异常，路径安全 |
-| 2 | 嵌入方对**攻击者可控的字节流**调用 `ValueDeserializer::ReadValue` | 字节流与 conveyor 必须可分离；若二者绑定原子传递（如 d8 Worker），攻击者无法篡改 id |
-| 3 | 字节流 wire version ≥ 15 | 低版本 kSharedObject 按 unknown tag 处理 |
-| 4 | release 构建 | debug 构建会先触发 `DCHECK(HasPersisted)` 终止，只能算 DoS 演示 |
-| 5 | id 足够大使 `vector.data() + id*8` 落在未映射或攻击者可预测区域 | 小越界读行为依堆布局而定；大 id（如 0x08000000，偏移 1GiB）可稳定触发访问违例 |
-
-**典型受影响场景**：嵌入方按 V8 API 契约保存 conveyor（文档明确要求 conveyor 生命周期覆盖后续反序列化），之后对来自外部的消息字节调 `ReadValue`——例如跨进程/跨线程消息总线中字节流可被第三方注入或篡改的宿主。
-
 
 ## 技术报告
 具体技术细节和技术报告,我会在[key08.com](https://key08.com/)发布,尽请关注.
