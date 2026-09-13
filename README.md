@@ -17,7 +17,7 @@ https://github.com/huoji120/QWEN-EXO-booster
 
 # 支持模型
 我是自己用于本地离线代码审计的,建议使用QWENEXO作为本地推理架构,并且使用QWWEN-27B系列模型.
-如果没条件,推荐使用deepseek-flash,不虚mythos.
+如果没条件,推荐使用deepseek-flash/glm5.3,不虚mythos.
 
 # 技术介绍
 
