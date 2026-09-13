@@ -42,16 +42,17 @@ func (state *modalState) wrapFindings(width int) {
 		for _, item := range f.items {
 			f.starts = append(f.starts, len(f.listWrapped))
 			for _, text := range []string{
-				fmt.Sprintf("#%d [%s] %s", item.ID, item.Severity, item.Title),
-				fmt.Sprintf("%s:%d", item.Path, item.Line),
+				fmt.Sprintf("#%d [%s] %s", item.ID, item.Severity, fitLine(item.Title, max(1, width-18))),
+				"位置 · " + fitLine(fmt.Sprintf("%s:%d", item.Path, item.Line), max(1, width-indent-7)),
 			} {
 				for _, line := range wrapLines(text, max(1, width-indent)) {
 					f.listWrapped = append(f.listWrapped, prefix+line)
 				}
 			}
+			f.listWrapped = append(f.listWrapped, prefix+strings.Repeat("─", max(1, width-indent)), "")
 		}
 		if len(f.items) == 0 {
-			f.listWrapped = wrapLines("当前尚无漏洞。后台审计继续运行；关闭后重新 /list 查看最新结果。", width)
+			f.listWrapped = wrapLines("尚无漏洞记录\n\n审计进行中。重新 /list 可刷新结果。", width)
 		}
 		f.listWidth = width
 		state.markFinding(f.selected, true)
@@ -126,13 +127,12 @@ func (m *Model) updateFindings(msg tea.Msg) tea.Cmd {
 			item := f.items[selected]
 			state.title = fmt.Sprintf("漏洞详情 · %d / %d · #%d", selected+1, len(f.items), item.ID)
 			state.lines = []string{
-				"标题：" + item.Title,
-				"严重程度：" + item.Severity,
-				fmt.Sprintf("位置：%s:%d", item.Path, item.Line),
-				"CWE：" + item.CWE,
-				"", "证据：", item.Evidence,
-				"", "影响：", item.Impact,
-				"", "建议：", item.Recommendation,
+				"── 概览 ──", item.Title, "",
+				"[" + item.Severity + "]  " + item.CWE,
+				fmt.Sprintf("位置 · %s:%d", item.Path, item.Line),
+				"", "── 证据 ──", "", item.Evidence,
+				"", "── 影响 ──", "", item.Impact,
+				"", "── 修复建议 ──", "", item.Recommendation,
 			}
 			state.wrapWidth = 0
 			state.scroll = 0

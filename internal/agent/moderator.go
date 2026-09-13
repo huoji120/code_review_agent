@@ -38,6 +38,7 @@ func (a *Agent) moderatorPrompt() string {
 严格区分阶段：current_stage=recon 时以尽快完成文件地图、候选线索和有效交接为目标；不要求确证漏洞，不要求审计结束投票，不因未验证候选或未覆盖区域阻止交接。全部侦察成员交接后系统直接进入审计，无需管理员批准；用 moderator_assign 记录的建议随交接进入审计，不能重开侦察。不要把审计深度的复核任务压回侦察成员。
 ` + reviewPolicy + `
 用 forum_moderate 关闭已经解决或过时的讨论并写清原因；保留历史，必要时 reopen。只置顶真正重要的协调帖，最多同时3帖（公告也占名额），满额必须先 unpin 一帖再 pin，不要循环争抢置顶。forum_announce 用于明确公告，不要滥发。普通帖按最后回复顶帖，置顶区始终优先。撤销漏洞必须先从 moderator_review_state 获取 finding_key，再读取源码提供具体反证，用 moderator_revoke_finding {finding_key,reason,evidence} 撤销；不确定时要求继续核查。
+定时巡查时整理 Todo：通过 moderator_review_state 查看当前团队待办与成员归属，每轮只处理一小批重复、过时、已经完成但状态未更新或长期无进展的条目，不要每轮完整重读数百条。Todo 属于各成员的独立状态，你不能直接修改别人的列表；用 moderator_irc_send 向负责人发出整理要求，包含条目标题、证据、保留项与合并/收尾理由，要求对方先读取自己的 review_state，核对本地 todo ID 后用 todo_update 更新并 worker_irc_reply 报告结果。团队汇总 Todo ID 是展示编号，不是成员本地 ID，禁止拿汇总 ID 直接更新。完成项仅在有完成证据时标 completed；重复或不再适用的条目可由负责人标 cancelled 并在标题注明原因及保留任务引用，不能把未验证任务冒充完成。保留历史与仍有效的未完成项，禁止为减少计数批量清空或随意完成；跨成员重复先确认谁继续负责。已完成阶段的成员不强制重开，仅把未决整理事项交接到当前审计负责人。用论坛记录本批整理结论；未收到明确回复或重新核对状态前不能宣称清理成功，同一批等待回复时不要反复催发或新建重复 Todo。
 每次激活工作有界：只读取当前需要的源码、论坛页与工具 buffer，禁止重新灌入全部历史。完成本轮观察后必须调用 moderator_idle {}，随后由系统在新活动或定时器触发时唤醒。没有值得沟通的新内容就直接 idle，不要自言自语刷帖。每轮最多 16 个模型回合或 16384 个估算生成 token，超出后由系统休眠，下一轮继续。
 moderator_assign {agent_id,content}：审计阶段向当前真实成员建议后续复核，已完成成员可在安全边界重新继续；侦察阶段只记录待审计建议并随交接传递，不重开侦察、不要求侦察成员完成深度验证。
 moderator_review_state {}：读取团队快照、成员和原始漏洞及 finding_key。结果过长时用 read_tool_buffer。

@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestBudgetCancelDoesNotStartAndInvalidModeCannotDisableLimits(t *testing.T) {
+func TestBudgetCancelDoesNotStartAndInvalidInputCannotDisableLimits(t *testing.T) {
 	m := forumTestModel(t)
 	if err := m.runner.ConfigureBudget(true, 8, 0, 0); err != nil {
 		t.Fatal(err)
@@ -16,17 +16,19 @@ func TestBudgetCancelDoesNotStartAndInvalidModeCannotDisableLimits(t *testing.T)
 	if m.modal == nil || !m.modal.budget || m.busy {
 		t.Fatal("infinite startup did not wait for budget")
 	}
-	m.modal.editor.SetValue("typo 0 0 0")
+	m.modal.budgetForm.fields[0].SetValue("-1")
 	m.updateModal(tea.KeyMsg{Type: tea.KeyCtrlS})
 	if m.modal == nil || m.modal.err == "" || !m.runner.BudgetStatus().InfiniteMode || m.busy {
-		t.Fatal("invalid mode silently disabled limits")
+		t.Fatal("invalid budget changed saved limits or launched audit")
 	}
 	m.updateModal(tea.KeyMsg{Type: tea.KeyEsc})
 	if m.pendingDir != "" || m.modal != nil || m.busy {
 		t.Fatal("cancel retained deferred startup")
 	}
 	m.submit("/budget")
-	m.modal.editor.SetValue("infinite 0 0 12345")
+	m.modal.budgetForm.fields[0].SetValue("0")
+	m.modal.budgetForm.fields[1].SetValue("0")
+	m.modal.budgetForm.fields[2].SetValue("12345")
 	m.updateModal(tea.KeyMsg{Type: tea.KeyCtrlS})
 	if m.busy || m.runner.BudgetStatus().TokenLimit != 12345 {
 		t.Fatal("budget edit launched cancelled directory")

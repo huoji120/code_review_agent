@@ -50,20 +50,29 @@ func Definitions() []llm.ToolDefinition {
 		},"required":["buffer_id"]}`),
 		definition("search_content", "搜索文件内容；支持跨行正则及模糊搜索，默认不区分大小写。ok=true 且 data=null 表示执行成功但无匹配。", searchParameters),
 		definition("search_context", "搜索文件内容，与 search_content 相同；优先调用 search_content。", searchParameters),
-		definition("git_inspect", "只读 Git 检查；仅 Git 可用且工作区是仓库时调用。支持增量审计、提交历史和 blame，不执行任何写入命令。", `{"type":"object","properties":{
-			"action":{"type":"string","enum":["status","changed_files","diff","log","show","blame"],"description":"检查动作，默认 status；blame 必须提供 path。"},
-			"base":{"type":"string","description":"diff/changed_files 比较起点；与 head 形成 base..head。引用不得以 - 开头或包含空白。"},
-			"head":{"type":"string","description":"比较终点，默认 HEAD。"},
-			"ref":{"type":"string","description":"show 的引用，默认 commit 或 HEAD；允许 Git 引用字符，不接受选项或空白。"},
-			"commit":{"type":"string","description":"ref 为空时 show 使用的引用。"},
-			"path":{"type":"string","description":"工作区内相对路径过滤；blame 必填。show 指定时读取该版本文件，否则返回提交概要。"},
+		definition("git_inspect", "只读 Git 历史与工作区检查；仅 Git 可用且工作区是仓库时调用。不执行 checkout/reset/commit/push 等写入操作。路径始终按字面量限定在工作区内，允许查询已删除或重命名的历史路径。大结果通过 read_tool_buffer 完整分页；优先缩小查询或 path。动作不支持或互斥的参数会报错。", `{"type":"object","properties":{
+			"action":{"type":"string","enum":["status","changed_files","diff","log","show","blame","branches","tags","tree","grep","rev_parse","merge_base"],"description":"默认 status。branches 列出本地分支及引用；tags 列出标签及引用；tree 递归列出历史树；grep 搜索历史文件并返回行号；rev_parse 解析提交身份；merge_base 查询共同祖先。"},
+			"base":{"type":"string","description":"diff/changed_files 比较起点；log 与 head 组成 base..head 范围（不可同时指定 ref/all）；merge_base 必填。引用不得以 - 开头或包含空白。"},
+			"head":{"type":"string","description":"diff/changed_files/log 范围或 merge_base 的终点，默认 HEAD。log 仅与 base 同用。"},
+			"ref":{"type":"string","description":"log/show/blame/tree/grep/rev_parse 的历史引用，默认 commit 或 HEAD；不接受选项或空白。"},
+			"commit":{"type":"string","description":"ref 为空时使用的历史引用，与 ref 适用动作相同。"},
+			"path":{"type":"string","description":"工作区相对字面量文件/目录路径；不得越出工作区，Git pathspec 通配符不会展开。blame 必填；log follow 必须是单一路径。show 指定时读取该版本文件，不能与 patch 同用；无 path 时返回提交概要或 patch。"},
 			"line_start":{"type":"integer","description":"blame 起始行，正数时启用行范围。"},
 			"line_end":{"type":"integer","description":"blame 结束行；小于 line_start 时改为 line_start。"},
-			"limit":{"type":"integer","description":"log 最多提交数；省略或非正数为 50。"},
-			"context":{"type":"integer","description":"diff 上下文行数；默认 0，负数按 0。"},
+			"limit":{"type":"integer","description":"log 最多提交数；省略或非正数为 50，最多 200。"},
+			"skip":{"type":"integer","minimum":0,"description":"仅 log：跳过前 N 个匹配提交，用于分页，默认 0。"},
+			"author":{"type":"string","description":"仅 log：提交作者过滤。"},
+			"since":{"type":"string","description":"仅 log：起始日期/时间，使用 Git 日期语法。"},
+			"until":{"type":"string","description":"仅 log：截止日期/时间，使用 Git 日期语法。"},
+			"query":{"type":"string","description":"log 按字面量搜索提交消息；grep 按字面量搜索历史文件内容，grep 必填且非空。"},
+			"search":{"type":"string","description":"仅 log：使用 Git -S 查找字面字符串出现次数发生增加或减少的提交。"},
+			"all":{"type":"boolean","description":"log 搜索所有引用（不能与 ref/base/follow 同用）；branches 包含本地及远程跟踪分支。默认 false。"},
+			"follow":{"type":"boolean","description":"仅 log：沿单个 path 的重命名历史跟踪；必须提供 path，不能与 all 同用。历史重命名越出子目录工作区时拒绝，需改用仓库根工作区查询。"},
+			"patch":{"type":"boolean","description":"仅 log/show：包含提交 diff，默认 false；show 指定 path 时不支持。"},
+			"context":{"type":"integer","description":"diff 或 log/show patch 的上下文行数；默认 0，负数按 0。"},
 			"staged":{"type":"boolean","description":"diff/changed_files 仅暂存改动；优先于 unstaged 和 base。"},
 			"unstaged":{"type":"boolean","description":"仅未暂存改动。changed_files 中优先于 base；diff 中 base 优先于此参数。"}
-		},"allOf":[{"if":{"properties":{"action":{"const":"blame"}},"required":["action"]},"then":{"required":["path"],"properties":{"path":{"minLength":1}}}}]}`),
+		},"allOf":[{"if":{"properties":{"action":{"const":"blame"}},"required":["action"]},"then":{"required":["path"],"properties":{"path":{"minLength":1}}}},{"if":{"properties":{"action":{"const":"grep"}},"required":["action"]},"then":{"required":["query"],"properties":{"query":{"minLength":1}}}},{"if":{"properties":{"action":{"const":"merge_base"}},"required":["action"]},"then":{"required":["base"],"properties":{"base":{"minLength":1}}}}]}`),
 		definition("todo_create", "创建具体中文审计待办；标题应包含文件、目录、模块、入口函数、变量或明确审计点，避免空泛描述。", `{"type":"object","properties":{
 			"title":{"type":"string","minLength":1,"description":"具体中文待办标题。"},
 			"priority":{"type":"string","description":"优先级，建议 low/medium/high；省略或空值为 medium。"}
@@ -71,7 +80,7 @@ func Definitions() []llm.ToolDefinition {
 		definition("todo_update", "更新待办。优先用 ID 定位；无正 ID 时按唯一完整标题匹配。完成时使用 completed。", `{"type":"object","properties":{
 			"id":{"type":["integer","string"],"description":"既有待办 ID，支持整数或整数字符串；正 ID 优先于标题匹配。"},
 			"title":{"type":"string","description":"有正 ID 时替换标题；否则用此完整标题定位唯一待办。"},
-			"status":{"type":"string","description":"新状态，建议 pending/in_progress/completed；done 会转换为 completed；空值保留原状态。"},
+			"status":{"type":"string","description":"新状态，建议 pending/in_progress/completed/cancelled；有证据完成时用 completed；重复或失效时用 cancelled 并在标题注明原因和保留任务引用；done 会转换为 completed；空值保留原状态。"},
 			"priority":{"type":"string","description":"新优先级，建议 low/medium/high；空值保留原值。"}
 		},"anyOf":[{"required":["id"]},{"required":["title"]}]}`),
 		definition("file_review_update", "将文件加入本次审计范围并更新状态。items 优先于 paths、path、inventory 选择器；目录/后缀/模式选择器取并集，无匹配可成功返回空结果。不得未读内容就批量标记 reviewed。", `{"type":"object","properties":{

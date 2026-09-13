@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -15,18 +14,23 @@ import (
 const maxBroadcastBytes = 16 * 1024
 
 type modalState struct {
-	title     string
-	lines     []string
-	wrapped   []string
-	wrapWidth int
-	scroll    int
-	compose   bool
-	editor    textarea.Model
-	err       string
-	findings  *findingsModal
-	sessions  *sessionsModal
-	agents    bool
-	budget    bool
+	title        string
+	lines        []string
+	wrapped      []string
+	wrapWidth    int
+	scroll       int
+	compose      bool
+	editor       textarea.Model
+	err          string
+	findings     *findingsModal
+	sessions     *sessionsModal
+	agents       bool
+	budget       bool
+	budgetForm   *budgetForm
+	agentIndex   int
+	agentDetails bool
+	agentStarts  []int
+	agentState   *agentsModal
 }
 
 type sessionsModal struct {
@@ -42,26 +46,10 @@ func (m *Model) openBudgetPrompt() tea.Cmd {
 		return nil
 	}
 	m.budgetCfg = m.runner.BudgetStatus()
-	editor := textarea.New()
-	editor.Prompt = ""
-	editor.Placeholder = "normal|infinite hours minutes tokens"
-	editor.ShowLineNumbers = false
-	editor.EndOfBufferCharacter = ' '
-	editor.MaxHeight = 0
-	editor.CharLimit = 256
-	mode := "normal"
-	if m.budgetCfg.InfiniteMode {
-		mode = "infinite"
-	}
-	tokens := "0"
-	if m.budgetCfg.TokenLimit > 0 {
-		tokens = fmt.Sprint(m.budgetCfg.TokenLimit)
-	}
-	editor.SetValue(fmt.Sprintf("%s %d %d %s", mode, m.budgetCfg.Hours, m.budgetCfg.Minutes, tokens))
-	m.modal = &modalState{title: "审计预算", compose: true, budget: true, editor: editor}
+	m.modal = &modalState{title: "审计预算 · /budget", budget: true, budgetForm: newBudgetForm(m.budgetCfg)}
 	m.input.Blur()
 	m.resizeModal()
-	return m.modal.editor.Focus()
+	return nil
 }
 
 func (m *Model) openBroadcast(value string) tea.Cmd {
@@ -105,6 +93,12 @@ func (m *Model) resizeModal() {
 	}
 	width, _, bodyHeight := m.modalSize()
 	inner := max(1, width-4)
+	if m.modal.budget {
+		for i := range m.modal.budgetForm.fields {
+			m.modal.budgetForm.fields[i].Width = max(1, inner-4)
+		}
+		return
+	}
 	if m.modal.compose {
 		m.modal.editor.SetWidth(inner)
 		m.modal.editor.SetHeight(bodyHeight)
@@ -137,9 +131,16 @@ func (m *Model) resizeModal() {
 	if m.modal.findings != nil && !m.modal.findings.detail {
 		m.modal.keepFindingVisible(bodyHeight)
 	}
+	if m.modal.agents && !m.modal.agentDetails {
+		m.modal.keepAgentVisible(bodyHeight)
+	}
 }
 
 func (m Model) wrapModal(width int) {
+	if m.modal.agents {
+		m.modal.wrapAgents(width)
+		return
+	}
 	if m.modal.findings != nil && !m.modal.findings.detail {
 		m.modal.wrapFindings(width)
 		return
@@ -156,9 +157,24 @@ func (m Model) wrapModal(width int) {
 
 func (m *Model) updateModal(msg tea.Msg) tea.Cmd {
 	state := m.modal
+	if state.budget {
+		return m.updateBudget(msg)
+	}
+	if key, ok := msg.(tea.KeyMsg); ok && !state.compose {
+		if converted, consumed := m.bottomShortcut(key, true); consumed {
+			if converted.Type != tea.KeyEnd {
+				return nil
+			}
+			msg = converted
+		}
+	}
 	if key, ok := msg.(tea.KeyMsg); ok {
 		switch key.String() {
 		case "esc", "ctrl+[":
+			if state.agents && state.agentDetails {
+				m.returnToAgents()
+				return nil
+			}
 			if state.findings != nil && state.findings.detail {
 				m.returnToFindings()
 				return nil
@@ -171,32 +187,6 @@ func (m *Model) updateModal(msg tea.Msg) tea.Cmd {
 		case "ctrl+s":
 			if state.compose {
 				value := state.editor.Value()
-				if state.budget {
-					p := strings.Fields(value)
-					if len(p) != 4 || (p[0] != "normal" && p[0] != "infinite") {
-						state.err = "格式：normal|infinite 小时 分钟 tokens"
-						return nil
-					}
-					h, e1 := strconv.Atoi(p[1])
-					mi, e2 := strconv.Atoi(p[2])
-					tok, e3 := strconv.ParseInt(p[3], 10, 64)
-					if e1 != nil || e2 != nil || e3 != nil || h < 0 || mi < 0 || tok < 0 {
-						state.err = "预算必须是非负整数，0表示不限"
-						return nil
-					}
-					if err := m.runner.ConfigureBudget(p[0] == "infinite", h, mi, tok); err != nil {
-						state.err = err.Error()
-						return nil
-					}
-					m.budgetCfg = m.runner.BudgetStatus()
-					dir := m.pendingDir
-					m.pendingDir = ""
-					cmd := m.closeModal()
-					if dir != "" {
-						return m.startDirectory(dir)
-					}
-					return cmd
-				}
 				if len(value) > maxBroadcastBytes || strings.TrimSpace(value) == "" {
 					state.err = "消息必须非空且不超过16 KiB"
 					return nil
@@ -225,6 +215,9 @@ func (m *Model) updateModal(msg tea.Msg) tea.Cmd {
 			state.err = ""
 		}
 		return cmd
+	}
+	if state.agents {
+		return m.updateAgents(msg)
 	}
 	if state.sessions != nil {
 		return m.updateSessions(msg)
@@ -357,36 +350,58 @@ func (m Model) overlayModal(frame string) string {
 	inner := width - 4
 	var content []string
 	status := ""
-	footer := "↑↓/PgUp/PgDn/滚轮 滚动 · Esc 关闭"
-	if m.modal.compose {
+	footer := "↑↓ 滚动 · PgUp/PgDn 翻页 · gg / End 到底 · Esc 关闭"
+	if m.modal.budget {
+		content = m.budgetLines(inner, bodyHeight)
+		status = "时间与 token 任一用尽即停；修改预算不重置已用量"
+		if !m.modal.budgetForm.infinite {
+			status = "普通模式不限额；下列预算仅在无限审计模式生效"
+		}
+		if m.modal.err != "" {
+			status = "! " + m.modal.err
+		}
+		footer = "Tab 切换 · ←→ 模式 · Ctrl+S 确认 · Esc 取消"
+	} else if m.modal.compose {
 		content = strings.Split(m.modal.editor.View(), "\n")
 		status = fmt.Sprintf("%d / %d bytes", len(m.modal.editor.Value()), maxBroadcastBytes)
-		if m.modal.budget {
-			status = "normal|infinite 小时 分钟 tokens；0不限；时间/token 任一耗尽即停"
-		}
 		if m.modal.err != "" {
 			status = m.modal.err
 		}
 		footer = "Ctrl+S 发送 · Enter 换行 · Esc 取消"
-		if m.modal.budget {
-			footer = "Ctrl+S 确认预算 · Esc 取消（不启动）"
-		}
 	} else {
 		m.wrapModal(inner)
 		content = viewport(m.modal.wrapped, m.modal.scroll, bodyHeight, false)
 		status = fmt.Sprintf("行 %d–%d / %d", min(len(m.modal.wrapped), m.modal.scroll+1), min(len(m.modal.wrapped), m.modal.scroll+bodyHeight), len(m.modal.wrapped))
 		if f := m.modal.findings; f != nil {
 			if f.detail {
-				footer = "↑↓/PgUp/PgDn/滚轮 滚动 · Esc 返回列表"
+				footer = "↑↓ 滚动 · PgUp/PgDn 翻页 · gg / End 到底 · Esc 返回列表"
 			} else {
-				status = fmt.Sprintf("选中 %d / %d · 打开时快照；重新 /list 刷新", min(len(f.items), f.selected+1), len(f.items))
-				footer = "↑↓/滚轮 选择 · PgUp/PgDn/Home/End · Enter 详情 · Esc 关闭"
+				status = fmt.Sprintf("选中 %d / %d · 本次快照", min(len(f.items), f.selected+1), len(f.items))
+				footer = "↑↓ 选择 · gg / End 末项 · Enter 详情 · Esc 关闭"
+			}
+		}
+		if m.modal.agents {
+			footer = "↑↓ 选择 · gg / End 末项 · Enter 诊断 · Esc 关闭"
+			if m.modal.agentDetails {
+				footer = "↑↓ 滚动 · gg / End 到底 · Esc 返回列表"
 			}
 		}
 	}
+	if inner < 60 {
+		switch {
+		case m.modal.budget:
+			footer = "Tab切换 · ^S保存 · Esc取消"
+		case m.modal.compose:
+			footer = "^S发送 · Esc取消"
+		case m.modal.agents && !m.modal.agentDetails, m.modal.findings != nil && !m.modal.findings.detail, m.modal.sessions != nil:
+			footer = "↑↓选 · Enter打开 · Esc关闭"
+		default:
+			footer = "↑↓滚动 · gg到底 · Esc返回"
+		}
+	}
 	rows := make([]string, height)
-	rows[0] = "╭" + strings.Repeat("─", width-2) + "╮"
-	rows[height-1] = "╰" + strings.Repeat("─", width-2) + "╯"
+	rows[0] = paintBorder("╭" + strings.Repeat("─", width-2) + "╮")
+	rows[height-1] = paintBorder("╰" + strings.Repeat("─", width-2) + "╯")
 	for row := 1; row < height-1; row++ {
 		text := ""
 		switch {
@@ -402,7 +417,18 @@ func (m Model) overlayModal(frame string) string {
 		// Preserve the textarea cursor's ANSI styling; all external body text
 		// has already passed through wrapLines/safeText.
 		text = truncate.String(text, uint(inner))
-		rows[row] = "│ " + text + strings.Repeat(" ", max(0, inner-runewidth.StringWidth(ansiEscape.ReplaceAllString(text, "")))) + " │"
+		switch {
+		case row == 1:
+			text = paintAccent(text)
+		case row == height-3 && m.modal.err != "":
+			text = paintLine("! " + fitLine(m.modal.err, max(1, inner-2)))
+		case row == height-3 || row == height-2:
+			text = paintMuted(text)
+		case !m.modal.compose && !m.modal.budget:
+			text = paintLine(text)
+		}
+		padding := strings.Repeat(" ", max(0, inner-runewidth.StringWidth(ansiEscape.ReplaceAllString(text, ""))))
+		rows[row] = paintBorder("│") + " " + text + padding + " " + paintBorder("│")
 	}
 	background := strings.Split(safeText(frame), "\n")
 	for len(background) < m.height {
@@ -412,7 +438,7 @@ func (m Model) overlayModal(frame string) string {
 	x, y := (m.width-width)/2, (m.height-height)/2
 	for row, line := range rows {
 		base := background[y+row]
-		background[y+row] = modalCells(base, 0, x) + line + modalCells(base, x+width, m.width-x-width)
+		background[y+row] = paintMuted(modalCells(base, 0, x)) + line + paintMuted(modalCells(base, x+width, m.width-x-width))
 	}
 	return strings.Join(background, "\n")
 }

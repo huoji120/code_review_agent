@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+
+	"code-review-agent/internal/config"
 )
 
 func validCall(call FunctionCall) error {
@@ -227,15 +229,17 @@ func readNativeBody(body io.Reader, textLimit int) ([]byte, error) {
 
 func (c *OpenAIClient) responsesTools(ctx context.Context, messages []Message, tools []ToolDefinition, emit func(Delta) error) (ToolResponse, error) {
 	payload := struct {
-		Model             string           `json:"model"`
-		Input             []any            `json:"input"`
-		Tools             []ToolDefinition `json:"tools"`
-		ParallelToolCalls bool             `json:"parallel_tool_calls"`
-		Temperature       float64          `json:"temperature"`
-		TopP              float64          `json:"top_p"`
-		MaxOutputTokens   int              `json:"max_output_tokens,omitempty"`
-		Stream            bool             `json:"stream"`
-	}{c.cfg.Model, nativeResponsesInput(messages), tools, false, c.cfg.Temperature, c.cfg.TopP, c.cfg.MaxOutputTokens, c.cfg.Stream}
+		Model             string                 `json:"model"`
+		Input             []any                  `json:"input"`
+		Tools             []ToolDefinition       `json:"tools"`
+		ParallelToolCalls bool                   `json:"parallel_tool_calls"`
+		Temperature       float64                `json:"temperature"`
+		TopP              float64                `json:"top_p"`
+		MaxOutputTokens   int                    `json:"max_output_tokens,omitempty"`
+		Stream            bool                   `json:"stream"`
+		Thinking          *config.ThinkingConfig `json:"thinking,omitempty"`
+		Reasoning         *reasoningOptions      `json:"reasoning,omitempty"`
+	}{c.cfg.Model, nativeResponsesInput(messages), tools, false, c.cfg.Temperature, c.cfg.TopP, c.cfg.MaxOutputTokens, c.cfg.Stream, c.cfg.Thinking, c.responseReasoning()}
 	progress, err := newGenerationTracker(ctx, emit)
 	if err != nil {
 		return ToolResponse{}, err
@@ -550,16 +554,18 @@ func (c *OpenAIClient) chatCompletionsTools(ctx context.Context, messages []Mess
 		nativeTools = append(nativeTools, map[string]any{"type": "function", "function": map[string]any{"name": tool.Name, "description": tool.Description, "parameters": tool.Parameters, "strict": tool.Strict}})
 	}
 	payload := struct {
-		Model             string             `json:"model"`
-		Messages          []any              `json:"messages"`
-		Tools             []any              `json:"tools"`
-		ParallelToolCalls bool               `json:"parallel_tool_calls"`
-		Temperature       float64            `json:"temperature"`
-		TopP              float64            `json:"top_p"`
-		MaxTokens         int                `json:"max_tokens,omitempty"`
-		Stream            bool               `json:"stream"`
-		StreamOptions     *chatStreamOptions `json:"stream_options,omitempty"`
-	}{c.cfg.Model, nativeChatInput(messages), nativeTools, false, c.cfg.Temperature, c.cfg.TopP, c.cfg.MaxOutputTokens, c.cfg.Stream, nil}
+		Model             string                 `json:"model"`
+		Messages          []any                  `json:"messages"`
+		Tools             []any                  `json:"tools"`
+		ParallelToolCalls bool                   `json:"parallel_tool_calls"`
+		Temperature       float64                `json:"temperature"`
+		TopP              float64                `json:"top_p"`
+		MaxTokens         int                    `json:"max_tokens,omitempty"`
+		Stream            bool                   `json:"stream"`
+		StreamOptions     *chatStreamOptions     `json:"stream_options,omitempty"`
+		Thinking          *config.ThinkingConfig `json:"thinking,omitempty"`
+		ReasoningEffort   string                 `json:"reasoning_effort,omitempty"`
+	}{c.cfg.Model, nativeChatInput(messages), nativeTools, false, c.cfg.Temperature, c.cfg.TopP, c.cfg.MaxOutputTokens, c.cfg.Stream, nil, c.cfg.Thinking, c.cfg.ReasoningEffort}
 	if c.cfg.Stream && usageFor(ctx) != nil {
 		payload.StreamOptions = &chatStreamOptions{IncludeUsage: true}
 	}

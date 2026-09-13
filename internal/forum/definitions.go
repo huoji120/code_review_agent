@@ -16,10 +16,11 @@ func Definitions() []llm.ToolDefinition {
 			"topic":{"type":"string","description":"标题，不超过 512 UTF-8 字节；可省略。"},
 			"content":{"type":"string","minLength":1,"description":"正文，去除空白后非空，且原文不超过 16384 UTF-8 字节。证据必须写完整，不使用占位内容。"}
 		},"required":["content"]}`),
-		definition("forum_threads", "按页发现论坛帖子，置顶优先，其余按最近活动排序。返回有界 excerpt 与来源消息 ID，不是完整正文；完整内容用 forum_read 正文分页。", `{"type":"object","properties":{
+		definition("forum_threads", "按页发现或全文搜索保留的标题、主帖和回复，置顶优先。query 是不区分大小写的部分文字匹配，不是正则/语义/错别字搜索。每帖返回首条匹配消息、每个关键词的首次命中（field、UTF-8 offset/end_offset、1起始行列）和附近片段，不列举全部出现位置。read_args 可直接传给 forum_read；正文 matches 的 offset 对应原始正文，topic 命中不对应正文偏移。", `{"type":"object","properties":{
 			"page":{"type":"integer","minimum":0,"description":"页号，从 1 开始；0 或省略为 1，超末页时取末页。"},
 			"limit":{"type":"integer","minimum":0,"description":"每页帖子数；0 或省略为 60，超过 64 截为 64。"},
-			"query":{"type":"string","description":"不区分大小写搜索标题和回复正文；省略不过滤。"}
+			"query":{"type":"string","maxLength":512,"description":"搜索全部保留正文，不仅摘要；上限512 UTF-8字节。省略不过滤。"},
+			"match":{"type":"string","enum":["phrase","all","any"],"description":"默认phrase：整个query作为连续片段；all/any：按空白拆分最多8个关键词，同一消息标题与正文须全部/任意匹配。不跨多条回复拼接命中。"}
 		},"additionalProperties":false}`),
 		definition("forum_read", "发现消息或分页读取指定消息正文。发现模式每条 content 最多 512 字节，外层 has_more 指剩余消息；正文模式须按 next_offset 续读至 has_more=false。完整 JSON 上限 4096 字节，实际正文可能小于 max_bytes。", `{"type":"object","properties":{
 			"after_id":{"type":"integer","minimum":0,"description":"消息发现游标，默认 0，不得超过当前论坛 latest_id；用 next_id 续读。正文模式仅允许 0 或省略。"},

@@ -40,6 +40,63 @@ API 返回余额不足、`insufficient_quota`/`insufficient_*`、额度耗尽或
 
 `/session`（或 `/sessions`）打开会话选择弹窗：↑↓、Home/End、PgUp/PgDn 或滚轮选择，Enter 恢复，Esc 关闭；运行/保存期间可浏览但不能恢复。`/restore` 不带参数也打开弹窗；支持完整路径、省略 `.json`、唯一文件名前缀/片段。多个匹配必须在弹窗中选择，不自动猜测。输入 `/restore <片段>` 后按 Tab 可补全唯一匹配，多个匹配打开候选列表。只补全路径，不修改或补造会话内容；恢复后输入 `go` 继续。
 
+### 终端阅读与预算
+
+- 论坛以标题、作者、正文摘录、回复分层显示；颜色区分选中项与状态，正文保留正常亮度。
+- 只读弹窗连续按两次 `g`（800ms 内）跳到底部；列表跳到末项。`Home/End` 仍可直接定位。主界面连续按两次 `Ctrl+G` 到底，不占用 `go` 等命令输入。
+- `/agents` 默认显示精简列表，↑↓选择、Enter 打开完整诊断；Esc 返回列表，再按 Esc 关闭。实时刷新保持所选成员身份。
+- `/list` 显示按风险着色的漏洞摘要，Enter 阅读完整证据、影响和建议；详情不会截掉保存的正文。
+- `/budget` 使用独立的模式、小时、分钟和 token 输入项。Tab/Shift+Tab 或 ↑↓切换，模式项用 ←→/空格切换，Ctrl+S 保存，Esc 取消。小时与分钟相加，0 表示不限。沿用原有运行语义：**预算限额只在无限审计模式生效**；普通模式允许团队共识结束。保存预算不清零已用时间/token，取消不会启动待审计目录。
+
+### AI 论坛搜索
+
+`forum_threads` 的 `query` 搜索全部保留的标题、主帖和回复，不仅搜索列表摘要。默认不区分大小写的连续片段匹配；`match: "all"` / `"any"` 将最多8个空白分隔关键词按全部/任意匹配，同一条消息的标题和正文可共同满足条件，但不跨多条回复拼凑命中。
+
+每帖返回首条匹配消息的 `excerpt_message_id`、各关键词的首次 `matches`（字段、原文 UTF-8 字节偏移及从1开始的行列）与附近片段。将返回的 `read_args` 原样传给 `forum_read`，即可从命中附近继续分页核对证据。只搜索当前保留历史，不提供语义检索、错别字纠正或全部出现位置列表。
+
+### Git 历史查询
+
+模型通过同一个只读 `git_inspect` 查询当前工作区的 Git 历史；需要本机安装 Git，目录位于 Git 工作树内。不会执行 checkout、reset、commit、push 或其他修改仓库的命令，也不会自动拉取远端。
+
+| action | 用途 |
+|---|---|
+| `status` / `changed_files` / `diff` | 工作区、暂存区及两个版本间的变化 |
+| `log` | 分页历史；支持 ref 或 base/head、作者、日期、提交说明、字符串增删与重命名追踪 |
+| `show` | 提交概要；`patch: true` 查看补丁；指定 `path` 读取该提交的历史文件 |
+| `blame` | 指定 `ref`、文件和行范围的归属 |
+| `branches` / `tags` | 本地/已存在远端分支引用、标签 |
+| `tree` / `grep` | 指定版本的递归目录、带行号的字面内容搜索 |
+| `rev_parse` / `merge_base` | 解析提交身份、查找共同祖先 |
+
+`log` 用 `limit`（默认50，最多200）与 `skip` 翻页，`query` 按字面过滤提交说明，`author` / `since` / `until` 过滤作者和日期，`search` 查询字符串出现次数改变的提交（Git `-S`）。`all: true` 查询所有已有引用，不能同时指定 ref/base/head 或 follow。`follow: true` 必须指定一个文件；已删除及重命名后的历史文件仍可查询。
+
+例如依次调用：
+
+```json
+{"action":"log","path":"src/handler.go","follow":true,"limit":20,"skip":0}
+{"action":"show","ref":"HEAD~2","patch":true,"context":3}
+{"action":"show","ref":"HEAD~2","path":"src/old-handler.go"}
+{"action":"blame","ref":"HEAD~2","path":"src/old-handler.go","line_start":40,"line_end":80}
+{"action":"grep","ref":"HEAD~2","query":"checkPermission"}
+```
+
+引用与路径不作为 shell 命令执行，路径按字面处理。子目录工作区不会通过文件内容查询越界；如果重命名历史跨出工作区，follow 会明确拒绝，需要由用户改用仓库根目录审计。每次 Git 子命令保留10秒超时。超长结果不再提前截掉尾部：按 `read_tool_buffer` 的 `next_offset` 连续读到 `eof`，再调用其他工具。`show` 的历史文本文件保留原始换行。
+
+### 推理配置
+
+推理配置默认启用 THINK，默认强度为 `high`。可在 `openai` 与 `compress_openai` 中分别设置：
+
+```yaml
+openai:
+  thinking:
+    type: enabled
+  reasoning_effort: high  # low / high / max
+```
+
+不支持 `thinking.type: disabled`，无效值会在启动时拒绝。未单独配置压缩模型时沿用主模型配置；单独配置压缩模型时其未填写的推理选项默认 `enabled` / `high`。Chat Completions 请求发送 `thinking: {type: enabled}` 与 `reasoning_effort`；Responses 请求发送 `thinking` 与标准 `reasoning: {effort: ...}`。这些是实际请求参数而非提示词，服务商需要支持相应字段和强度值；不会失败后静默去掉 THINK 或降低强度。
+
+管理员在既有定时巡查中分批整理 Todo：核对重复、过时、已完成但状态未更新的条目，通过 IRC 要求归属成员核对本地 ID 后更新并回复。已完成项须有证据，重复/失效项标记 `cancelled` 并注明原因和保留任务引用；不会物理删除历史或为了减少数字把未完成任务标为完成。管理员没有跨成员直接修改权限，收到确认前不得宣称整理成功。整理状态不等于缩减历史总条数，也不是 Todo 分页输出改造。
+
 而这个居然是遵循《Scaling Law》的
 
 ![img](img/5.png)

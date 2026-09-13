@@ -126,7 +126,7 @@ func TestGenerationProgressStaysVisibleAndRefreshesAgentsWithoutLogTicks(t *test
 	worker.Status = "running"
 	applyProgress(worker)
 	view = m.overlayModal("")
-	if !strings.Contains(view, "generation≈0 tok") || !strings.Contains(view, "尚无输出数据时间") {
+	if !strings.Contains(view, "generation≈0 tok") || strings.Contains(view, "generation 99 tok") {
 		t.Fatal("new waiting request inherited prior generation/activity")
 	}
 }
@@ -172,6 +172,7 @@ func TestForumClickWrappedHeaderAfterScrolling(t *testing.T) {
 		m.forumPage = forum.PostPage{Posts: []forum.Post{
 			{ID: 2, Root: forum.Message{ID: 2, Topic: "newer", Content: "preview"}},
 			{ID: 1, Root: forum.Message{ID: 1, Topic: strings.Repeat("wrapped-title ", 12), Content: strings.Repeat("body\n", 20)}},
+			{ID: 3, Root: forum.Message{ID: 3, Topic: strings.Repeat("following-title ", 12), Content: "following post"}},
 		}}
 		m.reconcileForum()
 		left, right, _, narrow := m.layout()
@@ -187,8 +188,12 @@ func TestForumClickWrappedHeaderAfterScrolling(t *testing.T) {
 		}
 		updated, _ := m.Update(tea.MouseMsg{X: x, Y: 3, Type: tea.MouseLeft})
 		m = updated.(Model)
-		if m.selectedPost != 1 || m.modal == nil || !strings.Contains(m.View(), "body") || strings.Contains(m.View(), "preview") {
+		if m.selectedPost != 1 || m.modal == nil {
 			t.Fatalf("width %d: scrolled wrapped-title click opened wrong post", width)
+		}
+		m.updateModal(tea.KeyMsg{Type: tea.KeyEnd})
+		if modal := m.overlayModal(""); !strings.Contains(modal, "body") || strings.Contains(modal, "preview") {
+			t.Fatalf("width %d: selected post body is not reachable", width)
 		}
 		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 		m = updated.(Model)

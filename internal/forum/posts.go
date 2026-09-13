@@ -5,7 +5,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 // Post is a top-level topic with its replies, ordered by latest activity.
@@ -68,23 +67,26 @@ func GroupPosts(messages []Message) []Post {
 }
 
 type postSummary struct {
-	ID               int64     `json:"id"`
-	Topic            string    `json:"topic"`
-	AgentID          string    `json:"agent_id"`
-	Stage            string    `json:"stage"`
-	AgentName        string    `json:"agent_name,omitempty"`
-	Excerpt          string    `json:"excerpt"`
-	ExcerptTopic     string    `json:"excerpt_topic"`
-	ExcerptMessageID int64     `json:"excerpt_message_id"`
-	ExcerptTruncated bool      `json:"excerpt_truncated"`
-	ReplyCount       int       `json:"reply_count"`
-	LatestMessageID  int64     `json:"latest_message_id"`
-	UpdatedAt        time.Time `json:"updated_at"`
-	RootMissing      bool      `json:"root_missing"`
-	Closed           bool      `json:"closed"`
-	Pinned           bool      `json:"pinned"`
-	Announcement     bool      `json:"announcement"`
-	ModerationReason string    `json:"moderation_reason,omitempty"`
+	ID               int64           `json:"id"`
+	Topic            string          `json:"topic"`
+	AgentID          string          `json:"agent_id"`
+	Stage            string          `json:"stage"`
+	AgentName        string          `json:"agent_name,omitempty"`
+	Excerpt          string          `json:"excerpt"`
+	ExcerptTopic     string          `json:"excerpt_topic"`
+	ExcerptMessageID int64           `json:"excerpt_message_id"`
+	ExcerptTruncated bool            `json:"excerpt_truncated"`
+	ReplyCount       int             `json:"reply_count"`
+	LatestMessageID  int64           `json:"latest_message_id"`
+	UpdatedAt        time.Time       `json:"updated_at"`
+	RootMissing      bool            `json:"root_missing"`
+	Closed           bool            `json:"closed"`
+	Pinned           bool            `json:"pinned"`
+	Announcement     bool            `json:"announcement"`
+	ModerationReason string          `json:"moderation_reason,omitempty"`
+	Matches          []searchHit     `json:"matches,omitempty"`
+	ExcerptOffset    int             `json:"excerpt_offset"`
+	ReadArgs         *searchReadArgs `json:"read_args,omitempty"`
 }
 
 const DefaultPageSize = 60
@@ -99,41 +101,12 @@ type PostPage struct {
 	Gap        bool
 }
 
-func matchesPostMessage(m Message, query string) bool {
-	return strings.Contains(strings.ToLower(m.Topic), query) || strings.Contains(strings.ToLower(m.Content), query)
-}
-
-func postExcerpt(p Post, query string) Message {
-	if !p.RootMissing && (query == "" || matchesPostMessage(p.Root, query)) {
-		return p.Root
-	}
-	for _, m := range p.Replies {
-		if query == "" || matchesPostMessage(m, query) {
-			return m
-		}
-	}
-	return Message{}
-}
-
-func matchingExcerpt(text, query string, limit int) string {
-	if query != "" {
-		lower := strings.ToLower(text)
-		if index := strings.Index(lower, query); index > 0 {
-			before := utf8.RuneCountInString(lower[:index])
-			for offset := range text {
-				if before == 0 {
-					text = text[offset:]
-					break
-				}
-				before--
-			}
-		}
-	}
-	return excerpt(text, limit)
-}
-
 // ListPosts is the shared numbered-page/search implementation for UI and tools.
 func (b *Board) ListPosts(page, pageSize int, search string) PostPage {
+	return b.listPosts(page, pageSize, newPostSearch(search, "phrase"))
+}
+
+func (b *Board) listPosts(page, pageSize int, query postSearch) PostPage {
 	if page < 1 {
 		page = 1
 	}
@@ -143,15 +116,14 @@ func (b *Board) ListPosts(page, pageSize int, search string) PostPage {
 	if pageSize > maxPage {
 		pageSize = maxPage
 	}
-	query := strings.ToLower(strings.TrimSpace(search))
 	b.mu.Lock()
 	posts := GroupPosts(b.msgs)
 	gap := len(b.msgs) > 0 && b.msgs[0].ID > 1
 	b.mu.Unlock()
-	if query != "" {
+	if len(query.terms) > 0 {
 		filtered := posts[:0]
 		for _, p := range posts {
-			if postExcerpt(p, query).ID != 0 {
+			if query.message(p).ID != 0 {
 				filtered = append(filtered, p)
 			}
 		}
@@ -178,13 +150,21 @@ func (b *Board) threadPage(raw json.RawMessage) string {
 		Page  int    `json:"page"`
 		Limit int    `json:"limit"`
 		Query string `json:"query"`
+		Match string `json:"match"`
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&args); err != nil || args.Page < 0 || args.Limit < 0 {
-		return failure("无效帖子分页参数；使用 page、limit、query")
+		return failure("无效帖子分页参数；使用 page、limit、query、match")
 	}
-	p := b.ListPosts(args.Page, args.Limit, args.Query)
+	if args.Match != "" && args.Match != "phrase" && args.Match != "all" && args.Match != "any" {
+		return failure("match 必须为 phrase、all 或 any")
+	}
+	query := newPostSearch(args.Query, args.Match)
+	if len(args.Query) > 512 || len(query.terms) > 8 {
+		return failure("query 最多 512 UTF-8 字节；多关键词最多 8 项")
+	}
+	p := b.listPosts(args.Page, args.Limit, query)
 	out := struct {
 		OK         bool          `json:"ok"`
 		Posts      []postSummary `json:"posts"`
@@ -195,16 +175,20 @@ func (b *Board) threadPage(raw json.RawMessage) string {
 		HasMore    bool          `json:"has_more"`
 		Gap        bool          `json:"gap"`
 	}{OK: true, Posts: []postSummary{}, Page: p.Page, PageSize: p.PageSize, TotalPosts: p.TotalPosts, TotalPages: p.TotalPages, HasMore: p.HasMore, Gap: p.Gap}
-	query := strings.ToLower(strings.TrimSpace(args.Query))
 	for _, post := range p.Posts {
 		topic := post.Root.Topic
 		if post.RootMissing {
 			topic = "原帖已过期"
 		}
-		m := postExcerpt(post, query)
-		preview := matchingExcerpt(m.Content, query, 256)
-		previewTopic := matchingExcerpt(m.Topic, query, 128)
-		out.Posts = append(out.Posts, postSummary{ID: post.ID, Topic: topic, AgentID: post.Root.AgentID, AgentName: post.Root.AgentName, Stage: post.Root.Stage, ReplyCount: len(post.Replies), LatestMessageID: post.LastID, UpdatedAt: post.UpdatedAt, RootMissing: post.RootMissing, Excerpt: preview, ExcerptTopic: previewTopic, ExcerptMessageID: m.ID, ExcerptTruncated: preview != m.Content || previewTopic != m.Topic, Closed: post.Root.Closed, Pinned: post.Root.Pinned, Announcement: post.Root.Announcement, ModerationReason: post.Root.ModerationReason})
+		m := query.message(post)
+		hits := query.hits(m)
+		preview, offset := searchExcerpt(m.Content, "content", hits, 256)
+		previewTopic, _ := searchExcerpt(m.Topic, "topic", hits, 128)
+		var readArgs *searchReadArgs
+		if len(hits) > 0 {
+			readArgs = &searchReadArgs{MessageID: m.ID, Offset: offset, All: true}
+		}
+		out.Posts = append(out.Posts, postSummary{ID: post.ID, Topic: topic, AgentID: post.Root.AgentID, AgentName: post.Root.AgentName, Stage: post.Root.Stage, ReplyCount: len(post.Replies), LatestMessageID: post.LastID, UpdatedAt: post.UpdatedAt, RootMissing: post.RootMissing, Excerpt: preview, ExcerptTopic: previewTopic, ExcerptMessageID: m.ID, ExcerptTruncated: preview != m.Content || previewTopic != m.Topic, Closed: post.Root.Closed, Pinned: post.Root.Pinned, Announcement: post.Root.Announcement, ModerationReason: post.Root.ModerationReason, Matches: hits, ExcerptOffset: offset, ReadArgs: readArgs})
 	}
 	return marshal(out)
 }

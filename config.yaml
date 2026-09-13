@@ -5,6 +5,9 @@ openai:
   base_url: https://api.deepseek.com/v1
   api_key: sk-xxxxxxx
   model: deepseek-v4-flash
+  thinking:
+    type: enabled
+  reasoning_effort: max
   temperature: 1
   top_p: 1
   max_context_tokens: 1048576
@@ -20,7 +23,8 @@ prompts:
 
 agent:
   recon_agents: 4
-  audit_agents: 32
+  #这边拉的越大效果越好,建议deepseek 32个以上,但是token也很多
+  audit_agents: 12
   forum_wait_seconds: 60
   # 无限模式：禁止模型结束审计；时间或 token 任一耗尽即停止。
   # 时间合计为 0、token 为 0 分别表示不限；两项均为 0 则无限。

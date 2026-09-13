@@ -51,6 +51,10 @@ type Model struct {
 	finalSavePending                                                   bool
 	budget                                                             agent.BudgetStatus
 	budgetCfg                                                          agent.BudgetStatus
+	bottomKey                                                          string
+	bottomAt                                                           time.Time
+	bottomModal                                                        *modalState
+	bottomFocus                                                        int
 }
 
 type operationEvent struct {
@@ -265,6 +269,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.MouseMsg:
+		m.bottomKey = ""
 		if m.modal != nil {
 			cmd := m.updateModal(x)
 			return m, cmd
@@ -308,6 +313,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 func (m *Model) handleKey(key tea.KeyMsg) (tea.Cmd, bool) {
+	if m.input.Value() == "" {
+		if converted, consumed := m.bottomShortcut(key, false); consumed {
+			if converted.Type != tea.KeyEnd {
+				return nil, true
+			}
+			key = converted
+		}
+	} else {
+		m.bottomKey = ""
+	}
 	if key.String() != "esc" && key.String() != "ctrl+[" {
 		m.escapeArmed = false
 	}
@@ -420,6 +435,22 @@ func (m *Model) handleKey(key tea.KeyMsg) (tea.Cmd, bool) {
 	}
 	return nil, false
 }
+
+// Only read-only modals own bare gg; the main prompt must still accept go.
+func (m *Model) bottomShortcut(key tea.KeyMsg, reading bool) (tea.KeyMsg, bool) {
+	name := key.String()
+	if name != "ctrl+g" && !(reading && name == "g") {
+		m.bottomKey = ""
+		return key, false
+	}
+	now := time.Now()
+	if m.bottomKey == name && m.bottomModal == m.modal && m.bottomFocus == m.focus && now.Sub(m.bottomAt) <= 800*time.Millisecond {
+		m.bottomKey = ""
+		return tea.KeyMsg{Type: tea.KeyEnd}, true
+	}
+	m.bottomKey, m.bottomAt, m.bottomModal, m.bottomFocus = name, now, m.modal, m.focus
+	return tea.KeyMsg{}, true
+}
 func (m *Model) stop() {
 	if !m.busy {
 		m.addEvent("当前没有运行中的审计。")
@@ -468,9 +499,7 @@ func (m *Model) applyEvent(e agent.Event) {
 	if e.Workers != nil {
 		m.workers = e.Workers
 		if m.modal != nil && m.modal.agents {
-			m.modal.lines = m.agentDetailLines()
-			m.modal.wrapWidth = 0
-			m.resizeModal()
+			m.refreshAgentsModal()
 		}
 	}
 	switch e.Kind {

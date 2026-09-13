@@ -14,8 +14,6 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
-var frameColor = lipgloss.Color("240")
-var focusColor = lipgloss.Color("73")
 var ansiEscape = regexp.MustCompile("\\x1b(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\))")
 
 func boundedText(text string, limit int) string {
@@ -192,7 +190,7 @@ func (m Model) leftContent(width, height int) (pinned, lines []string) {
 	if b.StopReason != "" {
 		pinned = append(pinned, wrapLines(b.StopReason, width)...)
 	}
-	maxPinned := max(1, (height-3-len(pinned))/2)
+	maxPinned := max(0, (height-6-len(pinned))/2)
 	for i, w := range m.workers {
 		activity := w.Activity
 		generation := generationLabel(w.Generation)
@@ -201,21 +199,27 @@ func (m Model) leftContent(width, height int) (pinned, lines []string) {
 		} else if w.LastModelActivity != "" {
 			activity += " · 输出 " + activityClock(w.LastModelActivity)
 		}
-		row := fmt.Sprintf("%s %s [%s] #%d %s", m.agentLabel(w.ID, w.Name), generation, statusLabel(w.Status), w.Turn, boundedText(activity, 220))
+		row := fmt.Sprintf("[%s] %s · #%d", statusLabel(w.Status), m.agentLabel(w.ID, w.Name), w.Turn)
+		detail := generation
+		if detail != "" {
+			detail += " · "
+		}
+		detail += boundedText(activity, 220)
 		if i < maxPinned {
-			pinned = append(pinned, fitLine(row, width))
+			pinned = append(pinned, fitLine(row, width), fitLine("  "+detail, width))
 		} else {
 			lines = append(lines, wrapLines(row, width)...)
+			lines = append(lines, wrapLines("  "+detail, width)...)
 		}
 	}
 	if len(m.workers) == 0 {
 		pinned = append(pinned, "团队尚未启动")
 	}
 	if len(m.workers) > maxPinned {
-		pinned = append(pinned, fitLine("其余 worker 见下方滚动区", width))
+		pinned = append(pinned, fitLine(fmt.Sprintf("提示：另 %d 位在下方 · /agents", len(m.workers)-maxPinned), width))
 	}
 	pinned = append(pinned, strings.Repeat("─", max(1, width)))
-	lines = append(lines, "最近操作 · /help 查看命令")
+	lines = append(lines, "── 最近操作 ──")
 	for _, e := range m.events {
 		text := e.at + " " + strings.TrimSpace(m.agentLabel(e.agentID, "")+" "+e.content)
 		lines = append(lines, wrapLines(text, width)...)
@@ -296,30 +300,34 @@ func (m Model) forumContent(width int) []string {
 		start := len(lines)
 		lines = append(lines, wrapLines(fmt.Sprintf("%s %s 帖子 #%d  %s", marker, state, post.ID, topic), width)...)
 		headers = append(headers, forumHeader{id: post.ID, start: start, end: len(lines)})
-		lines = append(lines, wrapLines(fmt.Sprintf("%s [%s] · 更新 %s · %d 保留回复", m.agentLabel(post.Root.AgentID, post.Root.AgentName), phaseLabel(post.Root.Stage), post.UpdatedAt.Local().Format("15:04:05"), len(post.Replies)), width)...)
+		lines = append(lines, wrapLines(fmt.Sprintf("作者：%s · %s · %s · %d 保留回复", m.agentLabel(post.Root.AgentID, post.Root.AgentName), phaseLabel(post.Root.Stage), post.UpdatedAt.Local().Format("15:04:05"), len(post.Replies)), width)...)
 		if expanded {
-			note := "展开：Board 当前保留正文与回复（不是完整历史保证）。"
+			note := "范围：当前保留正文与回复，并非完整历史。"
 			if post.RootMissing {
 				note = "保留缺口：原帖已过期；以下为当前保留回复。"
 			}
 			lines = append(lines, wrapLines(note, width)...)
 		}
 		if !post.RootMissing {
-			body := post.Root.Content
-			if !expanded {
-				body = boundedText(body, 240)
+			if expanded {
+				lines = append(lines, "")
+				lines = append(lines, wrapLines(post.Root.Content, width)...)
+			} else {
+				lines = append(lines, forumExcerpt("摘录："+post.Root.Content, width, 2)...)
 			}
-			lines = append(lines, wrapLines(body, width)...)
 		}
 		if expanded {
 			for _, reply := range post.Replies {
 				lines = append(lines, "")
-				lines = append(lines, wrapLines(fmt.Sprintf("回复 #%d · %s → #%d · %s", reply.ID, m.agentLabel(reply.AgentID, reply.AgentName), reply.ReplyTo, reply.CreatedAt.Local().Format("15:04:05")), width)...)
+				lines = append(lines, wrapLines(fmt.Sprintf("── 回复 #%d → #%d ──", reply.ID, reply.ReplyTo), width)...)
+				lines = append(lines, wrapLines(fmt.Sprintf("作者：%s · %s", m.agentLabel(reply.AgentID, reply.AgentName), reply.CreatedAt.Local().Format("15:04:05")), width)...)
 				lines = append(lines, wrapLines(reply.Content, width)...)
 			}
 		} else if len(post.Replies) > 0 {
 			reply := post.Replies[len(post.Replies)-1]
-			lines = append(lines, wrapLines("最新回复 · "+m.agentLabel(reply.AgentID, reply.AgentName)+"："+boundedText(reply.Content, 180), width)...)
+			lines = append(lines, "")
+			lines = append(lines, wrapLines("── 最新回复 · "+m.agentLabel(reply.AgentID, reply.AgentName)+" ──", width)...)
+			lines = append(lines, forumExcerpt("摘录："+reply.Content, width, 2)...)
 		}
 		headers[len(headers)-1].bodyEnd = len(lines)
 		lines = append(lines, strings.Repeat("─", max(1, width)), "")
@@ -330,6 +338,18 @@ func (m Model) forumContent(width int) []string {
 	if m.forumCache != nil {
 		*m.forumCache = forumRenderCache{width: width, revision: m.forumRevision, threadID: m.threadID, lines: lines, headers: headers}
 	}
+	return lines
+}
+
+// Previews are deliberately short; opening the thread retains every stored line.
+func forumExcerpt(text string, width, rows int) []string {
+	text = strings.Join(strings.Fields(safeText(text)), " ")
+	lines := wrapLines(boundedText(text, 480), width)
+	if len(lines) <= rows {
+		return lines
+	}
+	lines = lines[:rows]
+	lines[rows-1] = fitLine(lines[rows-1], max(0, width-2)) + fitLine(" …", width)
 	return lines
 }
 
@@ -454,9 +474,17 @@ func (m *Model) showForumPost(post forum.Post) {
 	if topic == "" {
 		topic = "讨论"
 	}
-	lines := []string{fmt.Sprintf("作者：%s · 阶段：%s · 帖子 ID：%d", m.agentLabel(post.Root.AgentID, post.Root.AgentName), post.Root.Stage, post.ID), "", post.Root.Content}
+	if post.RootMissing {
+		topic = "原帖不在当前保留窗口"
+	}
+	lines := []string{"标题：" + topic, "", fmt.Sprintf("更新：%s · %d 保留回复", post.UpdatedAt.Local().Format("2006-01-02 15:04:05"), len(post.Replies)), "范围：仅当前 Board 保留内容，不保证完整历史。", ""}
+	if post.RootMissing {
+		lines = append(lines, "保留缺口：原帖已过期，以下仅含当前保留回复。")
+	} else {
+		lines = append(lines, fmt.Sprintf("作者：%s · %s · %s", m.agentLabel(post.Root.AgentID, post.Root.AgentName), phaseLabel(post.Root.Stage), post.Root.CreatedAt.Local().Format("2006-01-02 15:04:05")), "", "── 正文 ──", "", post.Root.Content)
+	}
 	for _, reply := range post.Replies {
-		lines = append(lines, "", fmt.Sprintf("回复 #%d · %s", reply.ID, m.agentLabel(reply.AgentID, reply.AgentName)), reply.Content)
+		lines = append(lines, "", fmt.Sprintf("── 回复 #%d → #%d ──", reply.ID, reply.ReplyTo), fmt.Sprintf("作者：%s · %s · %s", m.agentLabel(reply.AgentID, reply.AgentName), phaseLabel(reply.Stage), reply.CreatedAt.Local().Format("2006-01-02 15:04:05")), "", reply.Content)
 	}
 	m.showDetail(fmt.Sprintf("论坛帖子 #%d · %s", post.ID, topic), lines)
 }
@@ -590,7 +618,13 @@ func renderPane(title string, lines []string, width, height int, focused bool) s
 			text = lines[i-2]
 		}
 		text = fitLine(text, inner)
-		rows[i] = border.Render("│") + " " + text + strings.Repeat(" ", max(0, inner-runewidth.StringWidth(text))) + " " + border.Render("│")
+		padding := strings.Repeat(" ", max(0, inner-runewidth.StringWidth(text)))
+		if i == 1 {
+			text = paintAccent(text)
+		} else {
+			text = paintLine(text)
+		}
+		rows[i] = border.Render("│") + " " + text + padding + " " + border.Render("│")
 	}
 	return strings.Join(rows, "\n")
 }
@@ -643,11 +677,11 @@ func (m Model) View() string {
 	} else {
 		panels = lipgloss.JoinHorizontal(lipgloss.Top, m.renderLeft(left, height), " ", m.renderForum(right, height))
 	}
-	help := "Tab 面板 · ↑↓选帖/读正文 Enter展收 ←→翻页 · 点击标题 · PgUp/PgDn/滚轮滚动 · Esc暂停 · /list /help"
+	help := "Tab 面板 · ↑↓选帖 Enter详情 ←→翻页 · Ctrl+G×2 到底 · 点击标题 · PgUp/PgDn/滚轮 · Esc暂停 · /help"
 	if narrow {
-		help = "↑↓选帖 Enter展收 ←→翻页 · Tab · Esc暂停 · /help"
+		help = "↑↓选帖 Enter详情 · Ctrl+G×2 到底 · Tab · Esc暂停 · /help"
 	}
-	return m.overlayModal(header + "\n" + panels + "\n" + fitLine(help, m.width) + "\n" + m.input.View())
+	return m.overlayModal(paintAccent(header) + "\n" + panels + "\n" + paintMuted(fitLine(help, m.width)) + "\n" + m.input.View())
 }
 func max(a, b int) int {
 	if a > b {

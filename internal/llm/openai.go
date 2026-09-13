@@ -119,12 +119,14 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, emit 
 		return c.responsesStream(ctx, messages, emit)
 	}
 	reqBody := chatRequest{
-		Model:       c.cfg.Model,
-		Messages:    messages,
-		Temperature: c.cfg.Temperature,
-		TopP:        c.cfg.TopP,
-		MaxTokens:   c.cfg.MaxOutputTokens,
-		Stream:      true,
+		Model:           c.cfg.Model,
+		Messages:        messages,
+		Temperature:     c.cfg.Temperature,
+		TopP:            c.cfg.TopP,
+		MaxTokens:       c.cfg.MaxOutputTokens,
+		Stream:          true,
+		Thinking:        c.cfg.Thinking,
+		ReasoningEffort: c.cfg.ReasoningEffort,
 	}
 	if usage != nil {
 		reqBody.StreamOptions = &chatStreamOptions{IncludeUsage: true}
@@ -360,11 +362,13 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message) (result str
 		return c.responsesChat(ctx, messages)
 	}
 	reqBody := chatRequest{
-		Model:       c.cfg.Model,
-		Messages:    messages,
-		Temperature: c.cfg.Temperature,
-		TopP:        c.cfg.TopP,
-		MaxTokens:   c.cfg.MaxOutputTokens,
+		Model:           c.cfg.Model,
+		Messages:        messages,
+		Temperature:     c.cfg.Temperature,
+		TopP:            c.cfg.TopP,
+		MaxTokens:       c.cfg.MaxOutputTokens,
+		Thinking:        c.cfg.Thinking,
+		ReasoningEffort: c.cfg.ReasoningEffort,
 	}
 	data, err := json.Marshal(reqBody)
 	if err != nil {
@@ -447,6 +451,7 @@ func (c *OpenAIClient) endpoint(path string) string {
 
 func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, emit func(Delta) error) error {
 	reqBody := responsesRequest{Model: c.cfg.Model, Input: responsesInput(messages), Temperature: c.cfg.Temperature, TopP: c.cfg.TopP, MaxOutputTokens: c.cfg.MaxOutputTokens, Stream: true}
+	reqBody.Thinking, reqBody.Reasoning = c.cfg.Thinking, c.responseReasoning()
 	data, err := json.Marshal(reqBody)
 	if err != nil {
 		return err
@@ -565,6 +570,7 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 
 func (c *OpenAIClient) responsesChat(ctx context.Context, messages []Message) (string, error) {
 	reqBody := responsesRequest{Model: c.cfg.Model, Input: responsesInput(messages), Temperature: c.cfg.Temperature, TopP: c.cfg.TopP, MaxOutputTokens: c.cfg.MaxOutputTokens}
+	reqBody.Thinking, reqBody.Reasoning = c.cfg.Thinking, c.responseReasoning()
 	data, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", err
@@ -644,13 +650,15 @@ func firstNonEmpty(values ...string) string {
 }
 
 type chatRequest struct {
-	Model         string             `json:"model"`
-	Messages      []Message          `json:"messages"`
-	Temperature   float64            `json:"temperature"`
-	TopP          float64            `json:"top_p"`
-	MaxTokens     int                `json:"max_tokens,omitempty"`
-	Stream        bool               `json:"stream,omitempty"`
-	StreamOptions *chatStreamOptions `json:"stream_options,omitempty"`
+	Model           string                 `json:"model"`
+	Messages        []Message              `json:"messages"`
+	Temperature     float64                `json:"temperature"`
+	TopP            float64                `json:"top_p"`
+	MaxTokens       int                    `json:"max_tokens,omitempty"`
+	Stream          bool                   `json:"stream,omitempty"`
+	StreamOptions   *chatStreamOptions     `json:"stream_options,omitempty"`
+	Thinking        *config.ThinkingConfig `json:"thinking,omitempty"`
+	ReasoningEffort string                 `json:"reasoning_effort,omitempty"`
 }
 
 type chatStreamOptions struct {
@@ -695,12 +703,25 @@ type streamResponse struct {
 }
 
 type responsesRequest struct {
-	Model           string               `json:"model"`
-	Input           []responsesInputItem `json:"input"`
-	Temperature     float64              `json:"temperature,omitempty"`
-	TopP            float64              `json:"top_p,omitempty"`
-	MaxOutputTokens int                  `json:"max_output_tokens,omitempty"`
-	Stream          bool                 `json:"stream,omitempty"`
+	Model           string                 `json:"model"`
+	Input           []responsesInputItem   `json:"input"`
+	Temperature     float64                `json:"temperature,omitempty"`
+	TopP            float64                `json:"top_p,omitempty"`
+	MaxOutputTokens int                    `json:"max_output_tokens,omitempty"`
+	Stream          bool                   `json:"stream,omitempty"`
+	Thinking        *config.ThinkingConfig `json:"thinking,omitempty"`
+	Reasoning       *reasoningOptions      `json:"reasoning,omitempty"`
+}
+
+type reasoningOptions struct {
+	Effort string `json:"effort"`
+}
+
+func (c *OpenAIClient) responseReasoning() *reasoningOptions {
+	if c.cfg.ReasoningEffort == "" {
+		return nil
+	}
+	return &reasoningOptions{Effort: c.cfg.ReasoningEffort}
 }
 
 type responsesInputItem struct {

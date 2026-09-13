@@ -19,17 +19,35 @@ type Config struct {
 }
 
 type OpenAIConfig struct {
-	BaseURL          string  `yaml:"base_url"`
-	APIInterface     string  `yaml:"api_interface"`
-	APIKey           string  `yaml:"api_key"`
-	APIKeyEnv        string  `yaml:"api_key_env"`
-	Model            string  `yaml:"model"`
-	Temperature      float64 `yaml:"temperature"`
-	TopP             float64 `yaml:"top_p"`
-	MaxContextTokens int     `yaml:"max_context_tokens"`
-	MaxOutputTokens  int     `yaml:"max_output_tokens"`
-	TimeoutSeconds   int     `yaml:"timeout_seconds"`
-	Stream           bool    `yaml:"stream"`
+	BaseURL          string          `yaml:"base_url"`
+	APIInterface     string          `yaml:"api_interface"`
+	APIKey           string          `yaml:"api_key"`
+	APIKeyEnv        string          `yaml:"api_key_env"`
+	Model            string          `yaml:"model"`
+	Temperature      float64         `yaml:"temperature"`
+	TopP             float64         `yaml:"top_p"`
+	MaxContextTokens int             `yaml:"max_context_tokens"`
+	MaxOutputTokens  int             `yaml:"max_output_tokens"`
+	TimeoutSeconds   int             `yaml:"timeout_seconds"`
+	Stream           bool            `yaml:"stream"`
+	Thinking         *ThinkingConfig `yaml:"thinking"`
+	ReasoningEffort  string          `yaml:"reasoning_effort"`
+}
+
+type ThinkingConfig struct {
+	Type string `yaml:"type" json:"type"`
+}
+
+func validateReasoning(cfg OpenAIConfig, section string) error {
+	if cfg.Thinking != nil && cfg.Thinking.Type != "enabled" {
+		return fmt.Errorf("%s.thinking.type must be enabled; disabled is not supported", section)
+	}
+	switch cfg.ReasoningEffort {
+	case "", "low", "high", "max":
+		return nil
+	default:
+		return fmt.Errorf("%s.reasoning_effort must be low, high or max", section)
+	}
 }
 
 type PromptConfig struct {
@@ -109,6 +127,12 @@ func Load(path string) (Config, error) {
 		}
 	}
 	applyDefaults(&cfg)
+	if err := validateReasoning(cfg.OpenAI, "openai"); err != nil {
+		return Config{}, err
+	}
+	if err := validateReasoning(cfg.CompressOpenAI, "compress_openai"); err != nil {
+		return Config{}, err
+	}
 	if _, err := cfg.Agent.BudgetDuration(); err != nil {
 		return Config{}, err
 	}
@@ -207,6 +231,12 @@ func looksLikeAPIKey(value string) bool {
 }
 
 func applyDefaults(cfg *Config) {
+	if cfg.OpenAI.Thinking == nil {
+		cfg.OpenAI.Thinking = &ThinkingConfig{Type: "enabled"}
+	}
+	if cfg.OpenAI.ReasoningEffort == "" {
+		cfg.OpenAI.ReasoningEffort = "high"
+	}
 	if cfg.Workspace == "" {
 		cfg.Workspace = "."
 	}
@@ -289,6 +319,12 @@ func applyCompressOpenAIDefaults(cfg *Config) {
 	}
 	if compress.APIInterface == "" {
 		compress.APIInterface = cfg.OpenAI.APIInterface
+	}
+	if compress.Thinking == nil {
+		compress.Thinking = &ThinkingConfig{Type: "enabled"}
+	}
+	if compress.ReasoningEffort == "" {
+		compress.ReasoningEffort = "high"
 	}
 	if compress.APIKey == "" && compress.APIKeyEnv == "" {
 		compress.APIKey = cfg.OpenAI.APIKey

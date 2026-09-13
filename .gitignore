@@ -4,3 +4,4 @@ config_duckgpt.yaml
 config_gpt.yaml
 config_ds.yaml
 code-review-agent.exe
+config_grok.yaml

@@ -133,19 +133,21 @@ func (m *Model) submit(value string) tea.Cmd {
 		case "help":
 			m.showDetail("操作帮助", []string{
 				"输入目录或 /dir <目录>：开始新审计；支持带空格的引号路径。",
-				"/budget：停止时设置 normal|infinite 小时 分钟 tokens；Ctrl+S 确认，0 表示不限，时间/token任一耗尽即停。",
+				"/budget：停止时打开预算表单；Tab 切换字段、←→ 选择模式、Ctrl+S 保存。0 表示不限；仅无限模式执行时间/token限额。",
 				"Esc：对话框内关闭/取消；其他时候请求暂停，worker 停止后 go 继续。",
 				"/say [消息]：打开广播草稿；Enter 换行，Ctrl+S 发送，Esc 取消。",
 				"/thread <ID>：展开帖子及楼内回复；/forum [页码]：返回倒序帖子列表。",
 				fmt.Sprintf("/search <关键词>：搜索标题、正文与回复；/search 清除；每页 %d 帖。", forum.DefaultPageSize),
 				"/reply <ID> <内容>：回复帖子；论坛 Home/End 跳至当前页首/尾。",
-				"/help、/agents、/report、/files [页码]、/sessions：独立可滚动对话框。",
+				"/help、/report、/files [页码]、/sessions：独立对话框；只读对话框 gg 跳到底部。",
 				"/list [页码]：漏洞选择列表；↑↓ 选择、Enter 详情、Esc 返回/关闭；后台继续运行。",
+				"/agents：精简实时列表；↑↓/翻页/滚轮选择、Enter 完整诊断、Esc 返回列表。",
 				"/export [文件]：完整 JSON 报告，默认 report.json。",
 				"/save [文件]：保存当前会话；/session：选择会话，↑↓选择、Enter恢复。",
 				"/restore [文件/片段]：支持省略.json、唯一片段；多个匹配弹窗选择，运行或保存时不可恢复。",
 				"Tab 切换面板；论坛空输入时 ↑↓ 选帖、Enter 展开/收起、←→ 翻页。",
 				"点击帖子标题展开/收起；PgUp/PgDn、鼠标滚轮在当前页独立滚动。",
+				"主面板连续两次 Ctrl+G 跳到底部，不占用命令输入中的 g。",
 				"/status：回到运行事件；窄屏用 Tab 切换状态与论坛。",
 			})
 		case "status":
@@ -353,48 +355,70 @@ func (m *Model) showDetail(title string, lines []string) {
 }
 
 func (m *Model) showAgents() {
-	m.showDetail("Agent 列表 /agents", m.agentDetailLines())
-	m.modal.agents = true
+	m.modal = &modalState{agents: true, agentState: &agentsModal{}}
+	m.input.Blur()
+	m.refreshAgentsModal()
 }
 
 func (m *Model) agentDetailLines() []string {
-	statuses := m.workers
-	lines := []string{fmt.Sprintf("当前阶段：%s · worker 数：%d", m.runner.Phase(), len(statuses))}
-	if len(statuses) == 0 {
-		lines = append(lines, "当前没有已创建的 Agent。")
-	} else {
-		for _, status := range statuses {
-			name := status.Name
-			if name == "" {
-				name = "未命名（" + status.ID + "）"
+	state := m.modal
+	lines := []string{fmt.Sprintf("当前阶段：%s · Agent 数：%d", safeText(m.runner.Phase()), len(m.workers)), ""}
+	state.agentState.lineStarts = state.agentState.lineStarts[:0]
+	if len(m.workers) == 0 {
+		return append(lines, "当前没有已创建的 Agent。")
+	}
+	if !state.agentDetails {
+		for i, status := range m.workers {
+			state.agentState.lineStarts = append(state.agentState.lineStarts, len(lines))
+			marker := "  "
+			if i == state.agentIndex {
+				marker = "> "
 			}
-			activity := status.Activity
+			activity := agentSummary(status.Activity, 64)
 			if activity == "" {
 				activity = "暂无活动"
 			}
-			lines = append(lines, fmt.Sprintf("%s [%s] · 阶段 %s · #%d · %s", name, status.Status, status.Phase, status.Turn, activity))
 			if status.Generation != nil {
-				progress := status.Generation
-				line := generationLabel(progress) + fmt.Sprintf(" · reasoning %d tok", progress.ReasoningTokens)
-				if progress.Estimated {
-					line += fmt.Sprintf(" · tool≈%d tok（UTF-8 字节估算；当前请求输出，非上下文）", progress.ToolTokens)
-				} else {
-					line += "（提供方用量；当前请求输出，非上下文）"
-				}
-				lines = append(lines, line)
-				if progress.ReceivedAt == "" {
-					lines = append(lines, "当前请求等待首段输出；尚无输出数据时间。")
-				} else {
-					lines = append(lines, "当前请求最后输出数据："+progress.ReceivedAt)
-				}
+				activity = generationLabel(status.Generation) + " · " + activity
 			}
-			if status.LastModelActivity != "" {
-				lines = append(lines, "最近模型输出："+status.LastModelActivity)
-			}
-			if status.LastToolActivity != "" {
-				lines = append(lines, "最近工具："+status.LastTool+" · "+status.LastToolActivity)
-			}
+			lines = append(lines,
+				fmt.Sprintf("%s[%s] %s · #%d", marker, agentSummary(status.Status, 24), agentSummary(agentName(status), 36), status.Turn),
+				"  "+activity, "")
 		}
+		return lines
+	}
+	if state.agentIndex < 0 || state.agentIndex >= len(m.workers) {
+		return append(lines, "该 Agent 已不在当前团队中。")
+	}
+	status := m.workers[state.agentIndex]
+	lines = append(lines, "── 状态 ──", "名称："+agentName(status), "ID："+status.ID,
+		fmt.Sprintf("[%s] 阶段 %s · 回合 #%d", status.Status, status.Phase, status.Turn),
+		"活动："+agentValue(status.Activity), "", "── 当前请求输出 ──")
+	if progress := status.Generation; progress != nil {
+		lines = append(lines, generationLabel(progress)+fmt.Sprintf(" · reasoning %d tok", progress.ReasoningTokens))
+		if progress.Estimated {
+			lines = append(lines, fmt.Sprintf("tool≈%d tok · UTF-8 字节估算", progress.ToolTokens))
+		} else {
+			lines = append(lines, "提供方用量；不单独提供工具 token 数。")
+		}
+		lines = append(lines, "以上为当前请求输出，非上下文 token 数。")
+		if progress.ReceivedAt == "" {
+			lines = append(lines, "当前请求等待首段输出；尚无输出数据时间。")
+		} else {
+			lines = append(lines, "当前请求最后输出数据："+progress.ReceivedAt)
+		}
+	} else {
+		lines = append(lines, "当前没有请求输出计数；不表示上下文为空。")
+	}
+	lines = append(lines, "", "── 活动时钟 ──", "最近模型输出："+agentValue(status.LastModelActivity),
+		"最近工具："+agentValue(status.LastTool), "最近工具时间："+agentValue(status.LastToolActivity),
+		"", "── 最近输出摘录 ──")
+	if status.OutputPartial {
+		lines = append(lines, "[partial] 未完成的输出摘录，不代表已执行工具或完整结论。")
+	}
+	lines = append(lines, agentValue(status.OutputExcerpt))
+	for i := range lines {
+		lines[i] = safeText(lines[i])
 	}
 	return lines
 }

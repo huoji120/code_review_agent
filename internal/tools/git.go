@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -22,6 +23,15 @@ type gitInspectArgs struct {
 	LineStart int    `json:"line_start"`
 	LineEnd   int    `json:"line_end"`
 	Limit     int    `json:"limit"`
+	Skip      int    `json:"skip"`
+	Author    string `json:"author"`
+	Since     string `json:"since"`
+	Until     string `json:"until"`
+	Query     string `json:"query"`
+	Search    string `json:"search"`
+	All       bool   `json:"all"`
+	Follow    bool   `json:"follow"`
+	Patch     bool   `json:"patch"`
 	Context   int    `json:"context"`
 	Staged    bool   `json:"staged"`
 	Unstaged  bool   `json:"unstaged"`
@@ -52,6 +62,7 @@ func (r *Registry) GitPrompt() string {
 		return b.String()
 	}
 	b.WriteString("- Git：可用。可以按需调用只读 `git_inspect`。\n")
+	b.WriteString("- 历史：log 支持 ref 或 base/head、limit/skip 分页、author/since/until/query（字面消息）/search（-S）、all/follow；show 可读历史 path，log/show 可用 patch。branches/tags/tree/grep/rev_parse/merge_base 用于只读导航。大结果请先 read_tool_buffer 读取完整内容，或缩小 query/path；下一次非 buffer 工具调用会清除旧 buffer。\n")
 	if root, err := r.runGitRaw("rev-parse", "--show-toplevel"); err == nil && strings.TrimSpace(root) != "" {
 		b.WriteString("- 仓库根目录：")
 		b.WriteString(filepath.ToSlash(strings.TrimSpace(root)))
@@ -78,6 +89,9 @@ func (r *Registry) gitInspect(raw json.RawMessage) Result {
 	if err != nil {
 		return Result{OK: false, Error: err.Error()}
 	}
+	if err := args.validate(); err != nil {
+		return Result{OK: false, Error: err.Error()}
+	}
 	args.normalize()
 	commandArgs, err := r.gitCommandArgs(args)
 	if err != nil {
@@ -87,14 +101,12 @@ func (r *Registry) gitInspect(raw json.RawMessage) Result {
 	if err != nil {
 		return Result{OK: false, Error: err.Error()}
 	}
-	truncated := false
-	output, truncated = trimGitOutput(output, r.gitOutputLimit())
 	result := gitInspectResult{Action: args.Action, Command: append([]string{"git"}, commandArgs...), Output: output}
 	if args.Action == "changed_files" {
 		result.Files = parseGitChangedFiles(output, gitCommandReturnsNameOnly(commandArgs))
 		result.Output = ""
 	}
-	return Result{OK: true, Data: result, Trunc: truncated}
+	return Result{OK: true, Data: result}
 }
 
 func (a *gitInspectArgs) normalize() {
@@ -104,6 +116,9 @@ func (a *gitInspectArgs) normalize() {
 	}
 	if a.Limit <= 0 {
 		a.Limit = 50
+	}
+	if a.Limit > 200 {
+		a.Limit = 200
 	}
 	if a.Context < 0 {
 		a.Context = 0
@@ -126,21 +141,49 @@ func (r *Registry) gitCommandArgs(args gitInspectArgs) ([]string, error) {
 	}
 	switch args.Action {
 	case "status":
-		return []string{"status", "--short", "--branch"}, nil
+		return []string{"status", "--short", "--branch", "--", gitWorkspacePath(path)}, nil
 	case "changed_files":
-		return r.gitChangedFilesArgs(args, path)
+		return r.gitChangedFilesArgs(args, gitWorkspacePath(path))
 	case "diff":
-		return r.gitDiffArgs(args, path)
+		return r.gitDiffArgs(args, gitWorkspacePath(path))
 	case "log":
-		command := []string{"log", "--oneline", "--decorate", "--no-ext-diff", "-n", strconv.Itoa(args.Limit)}
-		if path != "" {
-			command = append(command, "--", path)
-		}
-		return command, nil
+		return r.gitLogArgs(args, path)
 	case "show":
 		return r.gitShowArgs(args, path)
 	case "blame":
 		return r.gitBlameArgs(args, path)
+	case "branches":
+		command := []string{"for-each-ref", "--format=%(refname:short)\t%(objectname)\t%(refname)", "refs/heads/"}
+		if args.All {
+			command = append(command, "refs/remotes/")
+		}
+		return command, nil
+	case "tags":
+		return []string{"for-each-ref", "--format=%(refname:short)\t%(objectname)\t%(refname)", "refs/tags/"}, nil
+	case "tree", "grep":
+		ref, err := r.gitCommitRef(args.Ref)
+		if err != nil {
+			return nil, err
+		}
+		if args.Action == "tree" {
+			return []string{"ls-tree", "-r", "--full-name", ref, "--", gitWorkspacePath(path)}, nil
+		}
+		return []string{"grep", "--no-textconv", "-n", "-F", "-e", args.Query, ref, "--", gitWorkspacePath(path)}, nil
+	case "rev_parse":
+		if err := validateGitRef(args.Ref); err != nil {
+			return nil, err
+		}
+		return []string{"rev-parse", "--verify", "--end-of-options", args.Ref + "^{commit}"}, nil
+	case "merge_base":
+		base, err := r.gitCommitRef(args.Base)
+		if err != nil {
+			return nil, err
+		}
+		head, err := r.gitCommitRef(args.Head)
+		if err != nil {
+			return nil, err
+		}
+		return []string{"merge-base", base, head}, nil
 	default:
 		return nil, fmt.Errorf("unsupported git action: %s", args.Action)
 	}
@@ -148,14 +191,14 @@ func (r *Registry) gitCommandArgs(args gitInspectArgs) ([]string, error) {
 
 func (r *Registry) gitChangedFilesArgs(args gitInspectArgs, path string) ([]string, error) {
 	if args.Staged {
-		command := []string{"diff", "--name-only", "--cached"}
+		command := []string{"diff", "--no-ext-diff", "--no-textconv", "--name-only", "--cached"}
 		if path != "" {
 			command = append(command, "--", path)
 		}
 		return command, nil
 	}
 	if args.Unstaged {
-		command := []string{"diff", "--name-only"}
+		command := []string{"diff", "--no-ext-diff", "--no-textconv", "--name-only"}
 		if path != "" {
 			command = append(command, "--", path)
 		}
@@ -168,7 +211,7 @@ func (r *Registry) gitChangedFilesArgs(args gitInspectArgs, path string) ([]stri
 		if err := validateGitRef(args.Head); err != nil {
 			return nil, err
 		}
-		command := []string{"diff", "--name-only", args.Base + ".." + args.Head}
+		command := []string{"diff", "--no-ext-diff", "--no-textconv", "--name-only", args.Base + ".." + args.Head}
 		if path != "" {
 			command = append(command, "--", path)
 		}
@@ -182,7 +225,7 @@ func (r *Registry) gitChangedFilesArgs(args gitInspectArgs, path string) ([]stri
 }
 
 func (r *Registry) gitDiffArgs(args gitInspectArgs, path string) ([]string, error) {
-	command := []string{"diff", "--no-ext-diff", "--unified=" + strconv.Itoa(args.Context)}
+	command := []string{"diff", "--no-ext-diff", "--no-textconv", "--unified=" + strconv.Itoa(args.Context)}
 	if args.Staged {
 		command = append(command, "--cached")
 	} else if args.Base != "" {
@@ -203,24 +246,33 @@ func (r *Registry) gitDiffArgs(args gitInspectArgs, path string) ([]string, erro
 }
 
 func (r *Registry) gitShowArgs(args gitInspectArgs, path string) ([]string, error) {
-	if err := validateGitRef(args.Ref); err != nil {
+	ref, err := r.gitCommitRef(args.Ref)
+	if err != nil {
 		return nil, err
 	}
 	if path == "" {
-		return []string{"show", "--no-ext-diff", "--stat", "--oneline", "--decorate", args.Ref}, nil
+		command := []string{"show", "--no-ext-diff", "--no-textconv", "--stat", "--oneline", "--decorate"}
+		if args.Patch {
+			command = append(command, "--patch", "--unified="+strconv.Itoa(args.Context))
+		}
+		return append(command, ref, "--", "."), nil
 	}
 	repoPath, err := r.gitRepoPath(path)
 	if err != nil {
 		return nil, err
 	}
-	return []string{"show", args.Ref + ":" + repoPath}, nil
+	return []string{"cat-file", "blob", ref + ":" + repoPath}, nil
 }
 
 func (r *Registry) gitBlameArgs(args gitInspectArgs, path string) ([]string, error) {
 	if path == "" {
 		return nil, fmt.Errorf("path is required for blame")
 	}
-	command := []string{"blame", "--date=short"}
+	ref, err := r.gitCommitRef(args.Ref)
+	if err != nil {
+		return nil, err
+	}
+	command := []string{"blame", "--no-textconv", "--date=short"}
 	if args.LineStart > 0 {
 		lineEnd := args.LineEnd
 		if lineEnd < args.LineStart {
@@ -228,14 +280,16 @@ func (r *Registry) gitBlameArgs(args gitInspectArgs, path string) ([]string, err
 		}
 		command = append(command, "-L", fmt.Sprintf("%d,%d", args.LineStart, lineEnd))
 	}
-	command = append(command, "--", path)
+	command = append(command, ref, "--", path)
 	return command, nil
 }
 
 func (r *Registry) gitPathArg(input string) (string, error) {
-	input = strings.TrimSpace(strings.Trim(input, "\"'"))
 	if input == "" {
 		return "", nil
+	}
+	if strings.ContainsRune(input, '\x00') {
+		return "", fmt.Errorf("git path contains NUL")
 	}
 	abs, err := r.safePath(input)
 	if err != nil {
@@ -253,7 +307,7 @@ func (r *Registry) gitRepoPath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(filepath.ToSlash(prefix)) + path, nil
+	return filepath.ToSlash(filepath.Clean(strings.TrimRight(filepath.ToSlash(prefix), "\r\n") + path)), nil
 }
 
 func (r *Registry) runGit(args ...string) (string, error) {
@@ -269,15 +323,22 @@ func (r *Registry) runGitRaw(args ...string) (string, error) {
 	if _, err := exec.LookPath("git"); err != nil {
 		return "", fmt.Errorf("git unavailable: executable not found")
 	}
-	commandArgs := append([]string{"-c", "core.quotepath=false", "--no-pager"}, args...)
+	commandArgs := append([]string{"--no-optional-locks", "--literal-pathspecs", "-c", "core.quotepath=false", "-c", "core.fsmonitor=false", "-c", "color.ui=false", "-c", "diff.submodule=short", "-c", "log.showSignature=false", "-c", "log.follow=false", "--no-pager"}, args...)
 	cmd := exec.CommandContext(ctx, "git", commandArgs...)
 	cmd.Dir = r.workspace
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0", "GIT_LITERAL_PATHSPECS=1", "GIT_GLOB_PATHSPECS=0", "GIT_NOGLOB_PATHSPECS=0", "GIT_ICASE_PATHSPECS=0")
 	output, err := cmd.CombinedOutput()
 	text := strings.TrimRight(string(output), "\r\n")
+	if len(args) > 0 && args[0] == "cat-file" {
+		text = string(output)
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return text, fmt.Errorf("git command timed out")
 	}
 	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 && len(args) > 0 && args[0] == "grep" && text == "" {
+			return "", nil
+		}
 		if strings.TrimSpace(text) == "" {
 			return text, err
 		}
@@ -341,13 +402,6 @@ func parseGitChangedFiles(output string, nameOnly bool) []string {
 		files = append(files, filepath.ToSlash(path))
 	}
 	return files
-}
-
-func (r *Registry) gitOutputLimit() int {
-	if r.maxToolResultChars > 0 && r.maxToolResultChars < 24000 {
-		return r.maxToolResultChars
-	}
-	return 24000
 }
 
 func trimGitOutput(output string, limit int) (string, bool) {
