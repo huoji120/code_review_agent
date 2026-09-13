@@ -45,7 +45,16 @@ func toolReply(name string, args any) llm.ToolResponse {
 func (c *stagedClient) Chat(context.Context, []llm.Message) (string, error) {
 	return "", fmt.Errorf("staged tool fixture must use native calls")
 }
-func (c *stagedClient) ChatTools(ctx context.Context, messages []llm.Message, _ []llm.ToolDefinition, _ func(llm.Delta) error) (llm.ToolResponse, error) {
+func (c *stagedClient) ChatTools(ctx context.Context, messages []llm.Message, definitions []llm.ToolDefinition, _ func(llm.Delta) error) (llm.ToolResponse, error) {
+	if len(definitions) == 1 && definitions[0].Name == "finding_duplicate_verdict" {
+		var pair struct {
+			Existing tools.Finding `json:"existing"`
+		}
+		if err := json.Unmarshal([]byte(messages[1].Content), &pair); err != nil {
+			return llm.ToolResponse{}, err
+		}
+		return toolReply("finding_duplicate_verdict", map[string]any{"decision": "distinct", "existing_key": pair.Existing.Key, "reason": "fixture entries contain separate defects"}), nil
+	}
 	if c.blocked.Load() {
 		c.started <- struct{}{}
 		<-ctx.Done()
@@ -170,9 +179,6 @@ func newTestTeam(t *testing.T, client llm.Client) *Team {
 		t.Fatal(err)
 	}
 	team := NewTeam(cfg, p, client, client, r)
-	team.nameClient = &noticeClient{call: func(context.Context, []llm.Message) (string, error) {
-		return "", fmt.Errorf("naming disabled in unrelated fixture")
-	}}
 	t.Cleanup(func() { team.Close() })
 	return team
 }

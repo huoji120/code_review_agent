@@ -284,7 +284,6 @@ func (t *Team) LoadSession(path string) error {
 	_ = t.board.RestoreParticipants(s.ForumParticipants)
 	for _, saved := range allSaved {
 		a := newWorker(t.cfg, t.prompts, t.client, t.compressClient, t.registry.Fork(), saved.Status.ID, saved.Status.Phase, t.board)
-		a.nameClient = t.nameClient
 		a.onDisconnect = t.modelDisconnected
 		a.announcedName = saved.AnnouncedName
 		count := s.ReconAgents
@@ -315,7 +314,6 @@ func (t *Team) LoadSession(path string) error {
 		t.bindIRC(w)
 		t.workers = append(t.workers, w)
 		if saved.Status.Phase == phaseModerator {
-			a.nameClient = nil
 			a.assignment = ""
 			a.completed = false
 			a.moderateTool = t.moderatorTool

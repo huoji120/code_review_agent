@@ -114,9 +114,6 @@ func TestNotificationCancellationCheckpointRestoreAndCompactionRetry(t *testing.
 	team.createStageLocked(phaseRecon)
 	w := team.workers[0]
 	a := w.agent
-	if err := a.board.RegisterName(a.id, "Persistent reader"); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := a.board.Post("user", "user", "*", 0, "pending evidence", "precise excerpt"); err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +150,7 @@ func TestNotificationCancellationCheckpointRestoreAndCompactionRetry(t *testing.
 		t.Fatal(err)
 	}
 	a = restored.workers[0].agent
-	if a.forumPending != original || a.board.Name(a.id) != "Persistent reader" {
+	if a.forumPending != original || a.board.Name(a.id) != team.board.Name(a.id) {
 		t.Fatal("restore lost pending notice or chosen name")
 	}
 	a.cfg.Agent.RetryAttempts = 1

@@ -19,7 +19,7 @@ func validName(name string) bool {
 	return true
 }
 
-// RegisterName binds a model-chosen name to a stable routing ID permanently.
+// RegisterName permanently binds a public name to a stable routing ID.
 func (b *Board) RegisterName(id, name string) error {
 	for _, r := range name {
 		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
@@ -32,6 +32,10 @@ func (b *Board) RegisterName(id, name string) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.registerNameLocked(id, name)
+}
+
+func (b *Board) registerNameLocked(id, name string) error {
 	a, ok := b.agents[id]
 	if !ok || a.Stage == "user" || a.Stage == "system" {
 		return fmt.Errorf("this identity cannot register an agent name")
@@ -92,4 +96,36 @@ func (b *Board) RestoreNames(names map[string]string) error {
 		}
 	}
 	return nil
+}
+
+var presetNames = [...]string{
+	"布丁", "麻薯", "饭团", "桃子", "柠檬", "西瓜", "芒果", "草莓",
+	"葡萄", "樱桃", "荔枝", "椰子", "菠萝", "蓝莓", "橙子", "柚子",
+	"汤圆", "豆包", "烧麦", "饺子", "年糕", "蛋挞", "泡芙", "饼干",
+	"奶糖", "果冻", "爆米花", "小笼包", "糯米糍", "棉花糖", "南瓜饼", "土豆泥",
+}
+
+// EnsurePresetName preserves restored names and allocates under the board lock.
+// The first 32 names are bare; subsequent rounds use 001, 002, and so on.
+func (b *Board) EnsurePresetName(id string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	a, ok := b.agents[id]
+	if !ok || a.Stage == "user" || a.Stage == "system" {
+		return ""
+	}
+	if a.Name != "" {
+		return a.Name
+	}
+	for round := 0; ; round++ {
+		for _, base := range presetNames {
+			name := base
+			if round > 0 {
+				name = fmt.Sprintf("%s%03d", base, round)
+			}
+			if b.registerNameLocked(id, name) == nil {
+				return name
+			}
+		}
+	}
 }

@@ -228,7 +228,7 @@ func (m Model) agentLabel(id, name string) string {
 	case "system":
 		return "系统"
 	default:
-		return "正在命名"
+		return "未命名成员"
 	}
 }
 

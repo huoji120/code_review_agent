@@ -46,11 +46,12 @@ type Team struct {
 	mu                 sync.Mutex
 	emitMu             sync.Mutex
 	saveMu             sync.Mutex
+	reportMu           sync.Mutex
+	reportQueue        []chan struct{}
 	cfg                config.Config
 	prompts            prompt.Prompts
 	client             llm.Client
 	compressClient     llm.Client
-	nameClient         llm.Client
 	registry           *tools.Registry
 	board              *forum.Board
 	workers            []*teamWorker
@@ -88,10 +89,6 @@ func NewTeam(cfg config.Config, prompts prompt.Prompts, client, compressClient l
 		compressClient = client
 	}
 	t := &Team{cfg: cfg, prompts: prompts, client: client, compressClient: compressClient, registry: registry, phase: phaseRecon}
-	nameConfig := cfg.OpenAI
-	nameConfig.Temperature, nameConfig.TopP = 1, 1
-	nameConfig.MaxOutputTokens, nameConfig.TimeoutSeconds = 256, 30
-	t.nameClient = llm.NewOpenAIClient(nameConfig)
 	t.resetBoard()
 	return t
 }
@@ -348,7 +345,7 @@ func (t *Team) receive(w *teamWorker, e Event) {
 }
 
 func stageAssignment(stage string, count int) string {
-	assignment := fmt.Sprintf("本阶段有 %d 个独立 Agent。系统不预设角色、主题或文件范围。先调用 forum_roster 和 forum_threads 查看同伴，再通过 forum_post 提出候选分工；需要强提醒所有 Agent 时在正文加入 @全体成员（也支持 @all），收到提醒的 Agent 自主决定是否回应；随后用 forum_wait 等待同伴回复（等待有界，超时后继续），根据实际回复自行协商认领范围，避免重复并主动覆盖空白。不要把内部路由 ID 或启动顺序当作分工。名字在后台单独选择，不要调用或等待命名。", count)
+	assignment := fmt.Sprintf("本阶段有 %d 个独立 Agent。系统不预设角色、主题或文件范围。先调用 forum_roster 和 forum_threads 查看同伴，再通过 forum_post 提出候选分工；需要强提醒所有 Agent 时在正文加入 @全体成员（也支持 @all），收到提醒的 Agent 自主决定是否回应；随后用 forum_wait 等待同伴回复（等待有界，超时后继续），根据实际回复自行协商认领范围，避免重复并主动覆盖空白。不要把内部路由 ID 或启动顺序当作分工。名字从32个预制昵称中即时分配，重复加001等后缀，不调用模型命名。", count)
 	if stage == phaseAudit {
 		assignment += "这是全新的审计团队：先调用 read_handoff 按需读取结构化侦察资料，再根据论坛协商结果用 file_review_update 自行选择需要审计的文件；不要假设系统预先分配了任何文件。"
 	} else {
@@ -367,13 +364,12 @@ func (t *Team) createStageLocked(stage string) {
 	for i := 0; i < count; i++ {
 		id := fmt.Sprintf("%s-%d", stage, i+1)
 		a := newWorker(t.cfg, t.prompts, t.client, t.compressClient, t.registry.Fork(), id, stage, t.board)
-		a.nameClient = t.nameClient
 		a.onDisconnect = t.modelDisconnected
 		a.assignment = assignment
 		if stage == phaseAudit {
 			a.handoff = t.handoff
 		}
-		w := &teamWorker{agent: a, saved: workerSession{Status: WorkerStatus{ID: id, Phase: stage, Status: "pending"}, Assignment: a.assignment, Snapshot: cloneSnapshot(a.tools.Snapshot())}}
+		w := &teamWorker{agent: a, saved: workerSession{Status: WorkerStatus{ID: id, Name: t.board.Name(id), Phase: stage, Status: "pending"}, Assignment: a.assignment, Snapshot: cloneSnapshot(a.tools.Snapshot())}}
 		a.checkpoint = func(a *Agent) { t.capture(w, a) }
 		t.bindIRC(w)
 		t.workers = append(t.workers, w)
@@ -389,14 +385,6 @@ func (t *Team) Run(ctx context.Context, input string, emit func(Event)) {
 		t.emitMu.Unlock()
 		if emit != nil {
 			emit(Event{Kind: "error", Content: "审计团队已经在运行"})
-		}
-		return
-	}
-	if t.cfg.Agent.ReconAgents < 1 || t.cfg.Agent.ReconAgents > 32 || t.cfg.Agent.AuditAgents < 1 || t.cfg.Agent.AuditAgents > 32 {
-		t.mu.Unlock()
-		t.emitMu.Unlock()
-		if emit != nil {
-			emit(Event{Kind: "error", Content: "Agent 数量必须在 1 到 32 之间"})
 		}
 		return
 	}
@@ -655,7 +643,7 @@ func (t *Team) aggregateLocked() tools.Snapshot {
 			out.Todos = append(out.Todos, todo)
 		}
 		for _, f := range s.Snapshot.Findings {
-			key := fmt.Sprintf("%s:%d:%s:%s", f.Path, f.Line, strings.ToLower(f.Title), f.CWE)
+			key := findingKey(f)
 			if _, ok := findings[key]; !ok {
 				f.Key = findingKey(f)
 				f.ID = len(out.Findings) + 1

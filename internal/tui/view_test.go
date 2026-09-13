@@ -298,10 +298,6 @@ func TestBroadcastDialogRequiresConfirmationAndPreservesDraft(t *testing.T) {
 func TestChosenNameReplacesRoutingIDInStatusPostsAndHistory(t *testing.T) {
 	m := forumTestModel(t)
 	m.resize(160, 42)
-	m.applyEvent(agent.Event{Kind: "worker", AgentID: "recon-1", Content: "请求模型", Workers: []agent.WorkerStatus{{ID: "recon-1", Status: "running"}}})
-	if view := m.View(); strings.Contains(view, "recon-1") || !strings.Contains(view, "正在命名") {
-		t.Fatal("unnamed worker leaked its routing ID")
-	}
 	m.applyEvent(agent.Event{Kind: "tool", AgentID: "recon-1", Content: "calling read_file", Workers: []agent.WorkerStatus{{ID: "recon-1", Name: "追光者", Status: "running"}, {ID: "audit-1", Name: "守望者", Status: "running"}}})
 	m.forumPage = forum.PostPage{Posts: []forum.Post{{ID: 1, Root: forum.Message{ID: 1, AgentID: "recon-1", AgentName: "追光者", Topic: "入口证据", Content: "root evidence"}, Replies: []forum.Message{{ID: 2, AgentID: "audit-1", AgentName: "守望者", ReplyTo: 1, Content: "reply evidence"}}}}, Page: 1, TotalPages: 1, TotalPosts: 1}
 	m.reconcileForum()

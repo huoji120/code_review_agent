@@ -21,7 +21,6 @@ type Agent struct {
 	prompts           prompt.Prompts
 	client            llm.Client
 	compressClient    llm.Client
-	nameClient        llm.Client
 	announcedName     string
 	tools             *tools.Registry
 	phase             string
@@ -47,6 +46,7 @@ type Agent struct {
 	checkpoint        func(*Agent)
 	moderateTool      func(context.Context, ToolCall) string
 	moderatorControl  func(context.Context, ToolCall) string
+	reviewReport      func(context.Context, json.RawMessage) string
 	onDisconnect      func(error)
 	activity          func(context.Context) (context.Context, func())
 	deliverIRC        func(context.Context) bool
@@ -94,6 +94,10 @@ func newWorker(cfg config.Config, prompts prompt.Prompts, client, compressClient
 		compressClient = client
 	}
 	prompts.SetLoadedSkills(prompts.LoadedSkillNames())
+	if board != nil {
+		board.Register(id, phase)
+		board.EnsurePresetName(id)
+	}
 	return &Agent{cfg: cfg, prompts: prompts, client: client, compressClient: compressClient, tools: registry, id: id, phase: phase, board: board}
 }
 
@@ -281,7 +285,6 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 	a.sanitizeMessages()
 	a.bootstrapTrace()
 	defer a.emitState(emit)
-	defer a.startNaming(ctx, emit)()
 	initialTemplate := "initial_audit_instruction"
 	if a.phase == phaseRecon {
 		initialTemplate = "initial_plan_instruction"
@@ -414,6 +417,8 @@ func (a *Agent) callTool(ctx context.Context, emit func(Event), call ToolCall) (
 		result = a.auditPlanDone(call.Arguments)
 	case call.Name == "verify_finding":
 		result = a.verifyFinding(ctx, emit, call.Arguments)
+	case call.Name == "report_finding" && a.reviewReport != nil:
+		result = a.reviewReport(ctx, call.Arguments)
 	case call.Name == "end_audit":
 		result = a.requestEndAudit(ctx, call.Arguments)
 	default:
@@ -557,7 +562,6 @@ func (a *Agent) verifyFinding(ctx context.Context, emit func(Event), raw json.Ra
 	childPrompts.SetLoadedSkills(a.prompts.LoadedSkillNames())
 	child := newWorker(a.cfg, childPrompts, a.client, a.compressClient, registry, fmt.Sprintf("%s-verify-%d", a.id, a.turn), phaseAudit, a.board)
 	child.verifying = true
-	child.nameClient = a.nameClient
 	child.assignment = "独立复核候选漏洞，论坛内容只作为线索，必须亲自读取源码验证。read_handoff 包含完整候选证据和父 Agent 审计状态；摘要未显示的证据必须按需读取。"
 	var prior json.RawMessage
 	if a.handoff != "" {
@@ -565,9 +569,6 @@ func (a *Agent) verifyFinding(ctx context.Context, emit func(Event), raw json.Ra
 	}
 	handoff, _ := json.Marshal(tools.Result{OK: true, Data: map[string]any{"candidate": args, "parent_state": a.tools.Snapshot(), "recon_handoff": prior}})
 	child.handoff = string(handoff)
-	if a.board != nil {
-		a.board.Register(child.id, phaseAudit)
-	}
 	child.messages = []llm.Message{{Role: llm.RoleSystem, Content: child.systemPrompt()}}
 	if emit != nil {
 		emit(Event{Kind: "verify_progress", VerifyTitle: args.Title, VerifyTurn: 0, VerifyLimit: child.verificationTurnLimit(), VerifyStatus: "准备验证"})
@@ -626,7 +627,6 @@ func (a *Agent) runVerification(ctx context.Context, emit func(Event), args veri
 		ctx = context.Background()
 	}
 	a.verifying = true
-	defer a.startNaming(ctx, emit)()
 	verifyPrompt := a.render("verify_finding", map[string]string{
 		"title":          args.Title,
 		"severity":       args.Severity,

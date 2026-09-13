@@ -106,7 +106,7 @@ func Definitions() []llm.ToolDefinition {
 		definition("flow_review_delete", "删除已闭环、已转为漏洞或不再需要展示的临时 flow；名称不存在会报错。", `{"type":"object","properties":{"name":{"type":"string","minLength":1,"description":"既有 flow 名称。"}},"required":["name"]}`),
 		definition("review_state", "查看待办、项目笔记、文件/变量/flow 排查及漏洞状态；结束前检查实际覆盖。", `{"type":"object","properties":{"limit":{"type":"integer","description":"文件、变量、flow 三类各自最多条目数；省略或非正数为 80；不截断待办和漏洞。"}}}`),
 		definition("project_note_update", "替换完整项目级中文工作笔记，详细维护架构、认证鉴权、攻击面、状态流、文件角色、证据与待确认问题，而非仅写摘要。", `{"type":"object","properties":{"note":{"type":"string","minLength":1,"description":"完整笔记正文；替换旧笔记，不是追加。"}},"required":["note"]}`),
-		definition("report_finding", "提交高置信度、证据和利用链清晰且有实际危害的严重安全漏洞。先补全变量/flow 证据并参考独立 verify_finding 结论；报告后继续同源风险排查。", `{"type":"object","properties":{
+		definition("report_finding", "提交高置信度漏洞；团队按 FIFO 排队串行去重审核和写入。提交者等待结果，重复则返回 existing_key 而不新增；审核不确定或失败不登记。先补全证据并参考 verify_finding。", `{"type":"object","properties":{
 			"severity":{"type":"string","description":"按系统严重性分级选择 critical/high/medium/low；省略或空值默认为 medium。"},
 			"title":{"type":"string","minLength":1,"description":"中文漏洞标题。"},
 			"path":{"type":"string","minLength":1,"description":"主要证据所在文件路径。"},

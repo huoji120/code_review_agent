@@ -103,6 +103,7 @@ func (t *Team) bindIRC(w *teamWorker) {
 	if a.phase == phaseModerator {
 		return
 	}
+	a.reviewReport = func(ctx context.Context, raw json.RawMessage) string { return t.reviewFindingReport(ctx, w, raw) }
 	a.ircPending = func() []IRCMessage {
 		t.mu.Lock()
 		defer t.mu.Unlock()
