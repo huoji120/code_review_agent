@@ -545,7 +545,7 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 		case "response.failed", "response.cancelled":
 			return fmt.Errorf("openai responses %s: %s", chunk.Type, chunk.Response.failureDetail())
 		case "error", "response.error":
-			return fmt.Errorf("openai responses error: %s", firstNonEmpty(chunk.Message, chunk.Error.Message, chunk.Code, chunk.Error.Code, "unspecified API error"))
+			return fmt.Errorf("openai responses error: %s %s %s", chunk.Code, chunk.Error.Code, firstNonEmpty(chunk.Message, chunk.Error.Message, "unspecified API error"))
 		default:
 			// Done snapshots and unrelated tool/audio deltas are not answer text.
 			continue
@@ -754,7 +754,7 @@ type responsesResponse struct {
 }
 
 func (r responsesResponse) failureDetail() string {
-	return firstNonEmpty(r.Error.Message, r.Error.Code, r.IncompleteDetails.Reason, r.Status, "missing response status")
+	return strings.TrimSpace(r.Error.Code + " " + firstNonEmpty(r.Error.Message, r.IncompleteDetails.Reason, r.Status, "missing response status"))
 }
 
 func (r responsesResponse) completed() error {

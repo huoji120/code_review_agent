@@ -571,6 +571,7 @@ func (a *Agent) verifyFinding(ctx context.Context, emit func(Event), raw json.Ra
 	childPrompts.SetLoadedSkills(a.prompts.LoadedSkillNames())
 	child := newWorker(a.cfg, childPrompts, a.client, a.compressClient, registry, fmt.Sprintf("%s-verify-%d", a.id, a.turn), phaseAudit, a.board)
 	child.userBroadcastSource = a.userBroadcastSource
+	child.onDisconnect = a.onDisconnect
 	child.verifying = true
 	child.assignment = "独立复核候选漏洞，论坛内容只作为线索，必须亲自读取源码验证。read_handoff 包含完整候选证据和父 Agent 审计状态；摘要未显示的证据必须按需读取。"
 	var prior json.RawMessage

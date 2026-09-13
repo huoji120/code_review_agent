@@ -532,7 +532,7 @@ func consumeNativeResponses(ctx context.Context, body io.Reader, progress *gener
 		case "response.failed", "response.cancelled":
 			return ToolResponse{}, fmt.Errorf("openai native %s: %s", event.Type, event.Response.failureDetail())
 		case "error", "response.error":
-			return ToolResponse{}, fmt.Errorf("openai native error: %s", firstNonEmpty(event.Message, event.Error.Message, event.Code, event.Error.Code, "unspecified API error"))
+			return ToolResponse{}, fmt.Errorf("openai native error: %s %s %s", event.Code, event.Error.Code, firstNonEmpty(event.Message, event.Error.Message, "unspecified API error"))
 		}
 	}
 	if ctx.Err() != nil {
@@ -595,7 +595,7 @@ func (c *OpenAIClient) chatCompletionsTools(ctx context.Context, messages []Mess
 		}
 	}
 	if parsed.Error.Message != "" || parsed.Error.Code != "" {
-		return ToolResponse{}, fmt.Errorf("openai native chat error: %s", firstNonEmpty(parsed.Error.Message, parsed.Error.Code))
+		return ToolResponse{}, fmt.Errorf("openai native chat error: %s %s", parsed.Error.Code, parsed.Error.Message)
 	}
 	if len(parsed.Choices) != 1 {
 		return ToolResponse{}, &ToolProtocolError{Kind: "expected exactly one chat choice"}
@@ -699,7 +699,7 @@ func consumeNativeChat(ctx context.Context, body io.Reader, progress *generation
 			}
 		}
 		if chunk.Error.Message != "" || chunk.Error.Code != "" {
-			return ToolResponse{}, fmt.Errorf("openai native chat error: %s", firstNonEmpty(chunk.Error.Message, chunk.Error.Code))
+			return ToolResponse{}, fmt.Errorf("openai native chat error: %s %s", chunk.Error.Code, chunk.Error.Message)
 		}
 		if chunk.Usage != nil {
 			usage = chunk.Usage

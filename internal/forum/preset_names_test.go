@@ -8,21 +8,21 @@ import (
 
 func TestPresetNamesRoundsAndConcurrentUniqueness(t *testing.T) {
 	b := New(0)
-	for i := 0; i < 65; i++ {
+	for i := 0; i < 2*len(presetNames)+1; i++ {
 		id := fmt.Sprintf("a%d", i)
 		b.Register(id, "audit")
 		name := b.EnsurePresetName(id)
-		base := presetNames[i%32]
+		base := presetNames[i%len(presetNames)]
 		want := base
-		if i >= 32 {
-			want = fmt.Sprintf("%s%03d", base, i/32)
+		if i >= len(presetNames) {
+			want = fmt.Sprintf("%s%03d", base, i/len(presetNames))
 		}
 		if name != want {
 			t.Fatalf("member %d name=%q want=%q", i, name, want)
 		}
 	}
 	var wg sync.WaitGroup
-	for i := 65; i < 193; i++ {
+	for i := 2*len(presetNames) + 1; i < 6*len(presetNames)+1; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -36,7 +36,7 @@ func TestPresetNamesRoundsAndConcurrentUniqueness(t *testing.T) {
 	}
 	wg.Wait()
 	seen := map[string]bool{}
-	for i := 0; i < 193; i++ {
+	for i := 0; i < 6*len(presetNames)+1; i++ {
 		name := b.Name(fmt.Sprintf("a%d", i))
 		if seen[name] {
 			t.Fatalf("duplicate %q", name)
@@ -46,7 +46,7 @@ func TestPresetNamesRoundsAndConcurrentUniqueness(t *testing.T) {
 }
 func TestPresetAllocationHonorsHistoricalSuffixes(t *testing.T) {
 	b := New(0)
-	for i := 0; i < 32; i++ {
+	for i := range presetNames {
 		id := fmt.Sprintf("old%d", i)
 		b.Register(id, "audit")
 		if err := b.RegisterName(id, presetNames[i]); err != nil {

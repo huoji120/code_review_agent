@@ -40,8 +40,22 @@ func isModelDisconnect(err error) bool {
 	return strings.Contains(text, "openai status 5") || strings.Contains(text, "openai status 408:") || strings.Contains(text, "openai status 429:") || strings.Contains(text, "stream ended without response.completed") || strings.Contains(text, "connection reset") || strings.Contains(text, "connection refused") || strings.Contains(text, "broken pipe")
 }
 
+// Inspect API errors only, never generated text or ordinary tool output.
+func isBillingExhausted(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	for _, marker := range []string{"insufficient", "余额不足", "余额已耗尽", "额度不足", "额度已用尽", "欠费", "payment required", "credit balance", "credits exhausted", "quota exceeded", "quota_exceeded", "billing_hard_limit", "exceeded your current quota", "openai status 402:"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // A failed request is retried twice, then cooled down once and probed once.
-// The callback cancels the entire team only when the recovery probe fails.
+// The callback cancels the team on billing exhaustion or a failed recovery probe.
 func (a *Agent) modelRequest(ctx context.Context, emit func(Event), request func() (string, error)) (string, error) {
 	wait := a.waitRetry
 	if wait == nil {
@@ -58,6 +72,12 @@ func (a *Agent) modelRequest(ctx context.Context, emit func(Event), request func
 		}
 		if err == nil {
 			return answer, nil
+		}
+		if isBillingExhausted(err) {
+			if a.onDisconnect != nil {
+				a.onDisconnect(err)
+			}
+			return "", fmt.Errorf("API余额或额度不足，已立即终止全队运行，不再重试: %w", err)
 		}
 		if errors.Is(err, llm.ErrIncompleteGeneration) {
 			if incompleteRetries == 3 {
@@ -101,6 +121,10 @@ func (t *Team) modelDisconnected(err error) {
 	t.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if isBillingExhausted(err) {
+		t.publish(Event{Kind: "error", Content: "API余额或额度不足：已立即终止全队运行（包括管理员），保留进度，不重试、不等待冷却；充值后可手动 go 继续。" + err.Error()})
+		return
 	}
 	t.publish(Event{Kind: "error", Content: "模型服务在五分钟冷却后的探测仍失败；整个任务已安全暂停，输入 go 继续。" + err.Error()})
 }

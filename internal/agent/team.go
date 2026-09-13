@@ -363,7 +363,7 @@ func (t *Team) receive(w *teamWorker, e Event) {
 }
 
 func stageAssignment(stage string, count int) string {
-	assignment := fmt.Sprintf("本阶段有 %d 个独立 Agent。系统不预设角色、主题或文件范围。先调用 forum_roster 和 forum_threads 查看同伴，再通过 forum_post 提出候选分工；需要强提醒所有 Agent 时在正文加入 @全体成员（也支持 @all），收到提醒的 Agent 自主决定是否回应；随后用 forum_wait 等待同伴回复（等待有界，超时后继续），根据实际回复自行协商认领范围，避免重复并主动覆盖空白。不要把内部路由 ID 或启动顺序当作分工。名字从32个预制昵称中即时分配，重复加001等后缀，不调用模型命名。", count)
+	assignment := fmt.Sprintf("本阶段有 %d 个独立 Agent。系统不预设角色、主题或文件范围。先调用 forum_roster 和 forum_threads 查看同伴，再通过 forum_post 提出候选分工；需要强提醒所有 Agent 时在正文加入 @全体成员（也支持 @all），收到提醒的 Agent 自主决定是否回应；随后用 forum_wait 等待同伴回复（等待有界，超时后继续），根据实际回复自行协商认领范围，避免重复并主动覆盖空白。不要把内部路由 ID 或启动顺序当作分工。名字从预制昵称表中即时分配，重复加001等后缀，不调用模型命名。", count)
 	if stage == phaseAudit {
 		assignment += "这是全新的审计团队：先调用 read_handoff 按需读取结构化侦察资料，再根据论坛协商结果用 file_review_update 自行选择需要审计的文件；不要假设系统预先分配了任何文件。"
 	} else {
