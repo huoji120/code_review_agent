@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -155,15 +154,11 @@ func (a *Agent) systemPrompt() string {
 func (a *Agent) planSystemPrompt() string {
 	system := a.prompts.PlanSystemWithSkills()
 	system += "\n\n阶段边界：侦察应尽快完成，只读取必要证据建立地图、候选、具体待办和交接。不穷举源码，不在此阶段证明漏洞或逐项排除候选；未验证线索、覆盖空白及管理员深度复核建议都写入交接留给审计。交接齐备即调用 audit_plan_done，不等待管理员批准或全体审计结束投票；历史中的管理员补查要求也不能改变此阶段边界。"
-	system += "\n\n" + a.planWorkspacePrompt()
+	system += "\n\n" + a.tools.GitPrompt()
 	system += "\n\n" + a.planToolPrompt()
 	system += "\n\n" + a.skillToolPrompt()
 	system += "\n\n" + a.render("tool_protocol_guard", nil)
 	return system
-}
-
-func (a *Agent) planWorkspacePrompt() string {
-	return "# 当前工作区\n\n- 工作区：" + filepath.ToSlash(a.tools.Workspace()) + "\n- 规划阶段不会暴露 Git 审计工具；如需增量审计、blame 或 diff，必须等切换到执行阶段后再使用。"
 }
 
 func (a *Agent) planToolPrompt() string {
@@ -177,6 +172,7 @@ func (a *Agent) planToolPrompt() string {
 - list_files：按目录、深度或模式补充文件地图。参数：root、pattern、max_depth、include_hidden、limit。
 - read_file：只读取配置、入口、路由、鉴权、依赖描述等少量关键文件用于建图，不做漏洞结论。参数：path、offset、limit。
 - search_content：搜索用于建图的关键词，例如 route、controller、auth、upload、admin、plugin、template、config、action。参数：query、mode、root、include、limit、case_insensitive、case_sensitive。mode 支持 literal、regex、fuzzy；literal 是默认模式，query 按普通字符串包含搜索，不解析 .*、|、\b 等正则语法；使用正则语法时必须显式传 mode:"regex"。
+- git_inspect：只读查询 Git 状态、相关提交与差异、历史文件和引用。Git 可用时把当前版本与认领范围内的相关改动纳入建图，在论坛协商共享结果，避免所有人重复查询。先少量 log（如 limit:10）再定向 show/diff；不要遍历全部历史或提前验证漏洞。参数和 action 以本轮原生定义为准，超长结果按 read_tool_buffer 连续分页。
 - todo_create：创建执行阶段必须审计的具体 todo。todo 必须绑定地图优先级、具体文件/模块/入口/变量/审计点。
 - todo_update：修正规划阶段 todo。参数：id、status、title、priority。
 - file_review_update：绘制本次 one-shot 文件地图。文件排查默认为空，必须由你显式选择文件加入。支持 path 单文件、paths 多文件、dir/dirs + suffix/suffixes、pattern/patterns 从本地 inventory 批量加入。只能把文件标记为 reviewing 或 skipped，不要在规划阶段标记 reviewed。note 写明为什么纳入 one-shot 审计范围或为什么跳过。
@@ -362,7 +358,7 @@ func (a *Agent) phaseToolCorrection(name string) string {
 	}
 	if a.phase == phaseRecon {
 		switch name {
-		case "review_state", "list_files", "read_file", "search_content", "search_context", "todo_create", "todo_update", "file_review_update", "project_note_update", "audit_plan_done", "load_skill":
+		case "review_state", "list_files", "read_file", "search_content", "search_context", "git_inspect", "todo_create", "todo_update", "file_review_update", "project_note_update", "audit_plan_done", "load_skill":
 			return ""
 		default:
 			return "当前处于规划建图阶段，禁止调用 " + name + "。继续建图并通过原生 audit_plan_done 提交侦察交接。"
