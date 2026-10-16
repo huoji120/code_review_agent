@@ -329,6 +329,7 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 			return
 		}
 		call, _ := a.recordResponse(answer)
+		a.commitResponseContinuation(answer)
 		emit(Event{Kind: "assistant_done"})
 		fullResult := a.executeNativeTool(activityCtx, emit, call)
 		finish()
@@ -735,7 +736,6 @@ func (a *Agent) chatStream(ctx context.Context, emit func(Event)) (llm.ToolRespo
 			}
 		}
 		if err == nil {
-			a.commitResponseContinuation(response)
 			a.protocolFailures = 0
 			return response, nil
 		}

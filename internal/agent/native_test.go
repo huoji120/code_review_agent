@@ -31,11 +31,13 @@ func TestNativeLoopRetriesProtocolFailuresUntilValidCall(t *testing.T) {
 			}
 			return llm.ToolResponse{Calls: []llm.FunctionCall{{Name: "forum_post", Arguments: `{"content":"unsafe"}`}}}, nil
 		}
-		return toolReply("audit_plan_done", map[string]any{
+		response := toolReply("audit_plan_done", map[string]any{
 			"summary":     "done",
 			"audit_map":   "entry",
 			"audit_files": []string{"entry1.go"},
-		}), nil
+		})
+		response.ResponseID = "resp-tool-test"
+		return response, nil
 	}}
 	team := newTestTeam(t, client)
 	team.createStageLocked(phaseRecon)
@@ -43,6 +45,9 @@ func TestNativeLoopRetriesProtocolFailuresUntilValidCall(t *testing.T) {
 	a.Run(context.Background(), "inspect", func(Event) {})
 	if calls != 6 || a.runErr != nil || !a.completed || a.protocolFailures != 0 {
 		t.Fatalf("protocol recovery calls=%d err=%v completed=%v streak=%d", calls, a.runErr, a.completed, a.protocolFailures)
+	}
+	if a.responseID != "resp-tool-test" || a.responseMessageIndex >= len(a.messages) || a.messages[a.responseMessageIndex].Type != "function_call_output" {
+		t.Fatalf("continuation boundary=%q index=%d messages=%d", a.responseID, a.responseMessageIndex, len(a.messages))
 	}
 	for _, message := range a.messages {
 		if message.Type == "function_call" && message.Name == "forum_post" {
