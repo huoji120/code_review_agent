@@ -50,13 +50,46 @@ type FunctionCall struct {
 }
 
 type ToolResponse struct {
-	Content  string
-	Thinking string
-	Calls    []FunctionCall
+	Content    string
+	Thinking   string
+	Calls      []FunctionCall
+	ResponseID string
 }
 
 type ToolClient interface {
 	ChatTools(context.Context, []Message, []ToolDefinition, func(Delta) error) (ToolResponse, error)
+}
+
+// ResponsesContinuation carries the server-side Responses lineage and the
+// messages appended since the preceding successful request. It is deliberately
+// context-scoped so a shared OpenAIClient never owns cross-Agent state.
+type ResponsesContinuation struct {
+	PreviousResponseID string
+	Messages           []Message
+}
+
+type responsesContinuationContextKey struct{}
+
+// WithResponsesContinuation scopes a Responses continuation to one request.
+// Chat Completions callers ignore this value. The message slice is copied so
+// later Agent history mutation cannot alter an in-flight request.
+func WithResponsesContinuation(ctx context.Context, previousResponseID string, messages []Message) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	copied := append([]Message(nil), messages...)
+	return context.WithValue(ctx, responsesContinuationContextKey{}, ResponsesContinuation{PreviousResponseID: previousResponseID, Messages: copied})
+}
+
+func responsesContinuationFromContext(ctx context.Context) (ResponsesContinuation, bool) {
+	if ctx == nil {
+		return ResponsesContinuation{}, false
+	}
+	continuation, ok := ctx.Value(responsesContinuationContextKey{}).(ResponsesContinuation)
+	if !ok || strings.TrimSpace(continuation.PreviousResponseID) == "" {
+		return ResponsesContinuation{}, false
+	}
+	return continuation, true
 }
 
 var ErrToolProtocol = errors.New("openai tool protocol error")
@@ -450,7 +483,8 @@ func (c *OpenAIClient) endpoint(path string) string {
 }
 
 func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, emit func(Delta) error) error {
-	reqBody := responsesRequest{Model: c.cfg.Model, Input: responsesInput(messages), Temperature: c.cfg.Temperature, TopP: c.cfg.TopP, MaxOutputTokens: c.cfg.MaxOutputTokens, Stream: true}
+	previousResponseID, requestMessages := responsesContinuationInput(ctx, messages)
+	reqBody := responsesRequest{Model: c.cfg.Model, Input: responsesInput(requestMessages), PreviousResponseID: previousResponseID, Temperature: c.cfg.Temperature, TopP: c.cfg.TopP, MaxOutputTokens: c.cfg.MaxOutputTokens, Stream: true}
 	reqBody.Thinking, reqBody.Reasoning = c.cfg.Thinking, c.responseReasoning()
 	data, err := json.Marshal(reqBody)
 	if err != nil {
@@ -569,7 +603,8 @@ func (c *OpenAIClient) responsesStream(ctx context.Context, messages []Message, 
 }
 
 func (c *OpenAIClient) responsesChat(ctx context.Context, messages []Message) (string, error) {
-	reqBody := responsesRequest{Model: c.cfg.Model, Input: responsesInput(messages), Temperature: c.cfg.Temperature, TopP: c.cfg.TopP, MaxOutputTokens: c.cfg.MaxOutputTokens}
+	previousResponseID, requestMessages := responsesContinuationInput(ctx, messages)
+	reqBody := responsesRequest{Model: c.cfg.Model, Input: responsesInput(requestMessages), PreviousResponseID: previousResponseID, Temperature: c.cfg.Temperature, TopP: c.cfg.TopP, MaxOutputTokens: c.cfg.MaxOutputTokens}
 	reqBody.Thinking, reqBody.Reasoning = c.cfg.Thinking, c.responseReasoning()
 	data, err := json.Marshal(reqBody)
 	if err != nil {
@@ -626,6 +661,14 @@ func responsesInput(messages []Message) []responsesInputItem {
 		items = append(items, responsesInputItem{Role: role, Content: msg.Content})
 	}
 	return items
+}
+
+func responsesContinuationInput(ctx context.Context, messages []Message) (string, []Message) {
+	continuation, ok := responsesContinuationFromContext(ctx)
+	if !ok {
+		return "", messages
+	}
+	return continuation.PreviousResponseID, continuation.Messages
 }
 
 func joinAssistantParts(thinking, content string) string {
@@ -703,14 +746,15 @@ type streamResponse struct {
 }
 
 type responsesRequest struct {
-	Model           string                 `json:"model"`
-	Input           []responsesInputItem   `json:"input"`
-	Temperature     float64                `json:"temperature,omitempty"`
-	TopP            float64                `json:"top_p,omitempty"`
-	MaxOutputTokens int                    `json:"max_output_tokens,omitempty"`
-	Stream          bool                   `json:"stream,omitempty"`
-	Thinking        *config.ThinkingConfig `json:"thinking,omitempty"`
-	Reasoning       *reasoningOptions      `json:"reasoning,omitempty"`
+	Model              string                 `json:"model"`
+	Input              []responsesInputItem   `json:"input"`
+	PreviousResponseID string                 `json:"previous_response_id,omitempty"`
+	Temperature        float64                `json:"temperature,omitempty"`
+	TopP               float64                `json:"top_p,omitempty"`
+	MaxOutputTokens    int                    `json:"max_output_tokens,omitempty"`
+	Stream             bool                   `json:"stream,omitempty"`
+	Thinking           *config.ThinkingConfig `json:"thinking,omitempty"`
+	Reasoning          *reasoningOptions      `json:"reasoning,omitempty"`
 }
 
 type reasoningOptions struct {
@@ -765,6 +809,7 @@ type responsesOutputItem struct {
 }
 
 type responsesResponse struct {
+	ID                string            `json:"id"`
 	Status            string            `json:"status"`
 	Error             responsesAPIError `json:"error"`
 	IncompleteDetails struct {

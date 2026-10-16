@@ -54,15 +54,22 @@ func isBillingExhausted(err error) bool {
 	return false
 }
 
-// A failed request is retried twice, then cooled down once and probed once.
-// The callback cancels the team on billing exhaustion or a failed recovery probe.
+const (
+	modelRetryInitialDelay = time.Second
+	modelRetryMaxDelay     = 5 * time.Minute
+)
+
+// A network failure is retried until the request context is cancelled. The
+// delay grows exponentially, but saturates before duration arithmetic can
+// overflow. Billing exhaustion is handled separately and never retried.
 func (a *Agent) modelRequest(ctx context.Context, emit func(Event), request func() (string, error)) (string, error) {
 	wait := a.waitRetry
 	if wait == nil {
 		wait = waitModelRetry
 	}
 	incompleteRetries := 0
-	for attempt := 0; attempt < 4; attempt++ {
+	retryDelay := modelRetryInitialDelay
+	for {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
@@ -89,42 +96,36 @@ func (a *Agent) modelRequest(ctx context.Context, emit func(Event), request func
 			}
 			// The caller commits model output only on success. Repeat generation
 			// from that boundary, never replay the preceding successful tool.
-			attempt--
 			continue
 		}
 		if !isModelDisconnect(err) {
 			return "", err
 		}
-		if attempt == 3 {
-			if a.onDisconnect != nil {
-				a.onDisconnect(err)
-			}
-			return "", fmt.Errorf("模型服务恢复探测失败，任务已暂停；输入 go 可继续: %w", err)
+		if emit != nil {
+			emit(Event{Kind: "waiting", Content: fmt.Sprintf("模型服务断线；等待 %s 后继续重试（取消任务可停止）", retryDelay)})
 		}
-		if attempt == 2 {
-			if emit != nil {
-				emit(Event{Kind: "waiting", Content: "模型服务连续 3 次断线；等待 5 分钟后仅探测一次，失败将暂停整个任务"})
+		if err := wait(ctx, retryDelay); err != nil {
+			return "", err
+		}
+		if retryDelay < modelRetryMaxDelay {
+			if retryDelay > modelRetryMaxDelay/2 {
+				retryDelay = modelRetryMaxDelay
+			} else {
+				retryDelay *= 2
 			}
-			if err := wait(ctx, 5*time.Minute); err != nil {
-				return "", err
-			}
-		} else if emit != nil {
-			emit(Event{Kind: "info", Content: fmt.Sprintf("模型服务断线，正在尝试第 %d/3 次请求", attempt+2)})
 		}
 	}
-	panic("unreachable model retry state")
 }
 
 func (t *Team) modelDisconnected(err error) {
+	if !isBillingExhausted(err) {
+		return
+	}
 	t.mu.Lock()
 	cancel := t.cancel
 	t.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
-	if isBillingExhausted(err) {
-		t.publish(Event{Kind: "error", Content: "API余额或额度不足：已立即终止全队运行（包括管理员），保留进度，不重试、不等待冷却；充值后可手动 go 继续。" + err.Error()})
-		return
-	}
-	t.publish(Event{Kind: "error", Content: "模型服务在五分钟冷却后的探测仍失败；整个任务已安全暂停，输入 go 继续。" + err.Error()})
+	t.publish(Event{Kind: "error", Content: "API余额或额度不足：已立即终止全队运行（包括管理员），保留进度，不重试、不等待冷却；充值后可手动 go 继续。" + err.Error()})
 }

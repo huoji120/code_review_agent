@@ -16,6 +16,31 @@ func (a *Agent) addMessage(message llm.Message) {
 	a.appendTraceMessage(message)
 }
 
+func (a *Agent) invalidateResponseContinuation() {
+	a.responseID = ""
+	a.responseMessageIndex = 0
+}
+
+func (a *Agent) commitResponseContinuation(response llm.ToolResponse) {
+	if response.ResponseID == "" {
+		a.invalidateResponseContinuation()
+		return
+	}
+	a.responseID = response.ResponseID
+	a.responseMessageIndex = len(a.messages)
+}
+
+func (a *Agent) responsesRequestContext(ctx context.Context) context.Context {
+	if a.responseID == "" {
+		return ctx
+	}
+	if a.responseMessageIndex < 0 || a.responseMessageIndex > len(a.messages) {
+		a.invalidateResponseContinuation()
+		return ctx
+	}
+	return llm.WithResponsesContinuation(ctx, a.responseID, a.messages[a.responseMessageIndex:])
+}
+
 func (a *Agent) prepareRequest(ctx context.Context, emit func(Event)) error {
 	if err := ctx.Err(); err != nil {
 		return err

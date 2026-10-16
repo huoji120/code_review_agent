@@ -23,9 +23,11 @@ type Agent struct {
 	announcedName          string
 	tools                  *tools.Registry
 	phase                  string
-	messages               []llm.Message
-	pendingEndAudit        bool
 	trace                  *traceLog
+	messages               []llm.Message
+	responseID             string
+	responseMessageIndex   int
+	pendingEndAudit        bool
 	tracePath              string
 	traceErr               error
 	traceBootstrapped      bool
@@ -107,6 +109,7 @@ func newWorker(cfg config.Config, prompts prompt.Prompts, client, compressClient
 }
 
 func (a *Agent) sanitizeMessages() {
+	a.invalidateResponseContinuation()
 	if len(a.messages) == 0 {
 		a.messages = []llm.Message{{Role: llm.RoleSystem, Content: a.systemPrompt()}}
 		return
@@ -735,6 +738,7 @@ func (a *Agent) chatStream(ctx context.Context, emit func(Event)) (llm.ToolRespo
 			}
 		}
 		if err == nil {
+			a.commitResponseContinuation(response)
 			a.protocolFailures = 0
 			return response, nil
 		}
@@ -845,7 +849,8 @@ func (a *Agent) chatStreamOnce(ctx context.Context, emit func(Event)) (llm.ToolR
 		lastFlush = time.Now()
 	}
 	var sawContent, sawThinking bool
-	response, err := client.ChatTools(ctx, a.messages, a.toolDefinitions(), func(delta llm.Delta) error {
+	requestCtx := a.responsesRequestContext(ctx)
+	response, err := client.ChatTools(requestCtx, a.messages, a.toolDefinitions(), func(delta llm.Delta) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -1048,6 +1053,7 @@ func (a *Agent) compressMessages(ctx context.Context, emit func(Event), reason s
 		return fmt.Errorf("系统提示与压缩后状态仍超过上下文预算，请调整模型上下文/输出配置")
 	}
 	a.messages = replacement
+	a.invalidateResponseContinuation()
 	emit(Event{Kind: "ui_compact", Content: "## 上下文已压缩\n\n" + compressed})
 	a.emitState(emit)
 	return nil

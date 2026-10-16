@@ -228,18 +228,24 @@ func readNativeBody(body io.Reader, textLimit int) ([]byte, error) {
 }
 
 func (c *OpenAIClient) responsesTools(ctx context.Context, messages []Message, tools []ToolDefinition, emit func(Delta) error) (ToolResponse, error) {
+	previousResponseID, requestMessages := responsesContinuationInput(ctx, messages)
 	payload := struct {
-		Model             string                 `json:"model"`
-		Input             []any                  `json:"input"`
-		Tools             []ToolDefinition       `json:"tools"`
-		ParallelToolCalls bool                   `json:"parallel_tool_calls"`
-		Temperature       float64                `json:"temperature"`
-		TopP              float64                `json:"top_p"`
-		MaxOutputTokens   int                    `json:"max_output_tokens,omitempty"`
-		Stream            bool                   `json:"stream"`
-		Thinking          *config.ThinkingConfig `json:"thinking,omitempty"`
-		Reasoning         *reasoningOptions      `json:"reasoning,omitempty"`
-	}{c.cfg.Model, nativeResponsesInput(messages), tools, false, c.cfg.Temperature, c.cfg.TopP, c.cfg.MaxOutputTokens, c.cfg.Stream, c.cfg.Thinking, c.responseReasoning()}
+		Model              string                 `json:"model"`
+		Input              []any                  `json:"input"`
+		PreviousResponseID string                 `json:"previous_response_id,omitempty"`
+		Tools              []ToolDefinition       `json:"tools"`
+		ParallelToolCalls  bool                   `json:"parallel_tool_calls"`
+		Temperature        float64                `json:"temperature"`
+		TopP               float64                `json:"top_p"`
+		MaxOutputTokens    int                    `json:"max_output_tokens,omitempty"`
+		Stream             bool                   `json:"stream"`
+		Thinking           *config.ThinkingConfig `json:"thinking,omitempty"`
+		Reasoning          *reasoningOptions      `json:"reasoning,omitempty"`
+	}{
+		Model: c.cfg.Model, Input: nativeResponsesInput(requestMessages), PreviousResponseID: previousResponseID,
+		Tools: tools, ParallelToolCalls: false, Temperature: c.cfg.Temperature, TopP: c.cfg.TopP,
+		MaxOutputTokens: c.cfg.MaxOutputTokens, Stream: c.cfg.Stream, Thinking: c.cfg.Thinking, Reasoning: c.responseReasoning(),
+	}
 	progress, err := newGenerationTracker(ctx, emit)
 	if err != nil {
 		return ToolResponse{}, err
@@ -294,7 +300,9 @@ func (c *OpenAIClient) responsesTools(ctx context.Context, messages []Message, t
 	if ctx.Err() != nil {
 		return ToolResponse{}, context.Cause(ctx)
 	}
-	return text.result(calls), nil
+	result := text.result(calls)
+	result.ResponseID = parsed.ID
+	return result, nil
 }
 
 type responseCallState struct {
@@ -530,7 +538,9 @@ func consumeNativeResponses(ctx context.Context, body io.Reader, progress *gener
 			if ctx.Err() != nil {
 				return ToolResponse{}, context.Cause(ctx)
 			}
-			return text.result(calls), nil
+			result := text.result(calls)
+			result.ResponseID = event.Response.ID
+			return result, nil
 		case "response.incomplete":
 			return ToolResponse{}, incompleteResponse(event.Response)
 		case "response.failed", "response.cancelled":

@@ -33,9 +33,6 @@ func TestResponsesReplaysHistoryAsEasyMessages(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		if _, ok := body["previous_response_id"]; ok {
-			t.Error("stateless history unexpectedly depends on previous_response_id")
-		}
 		var input []struct {
 			Role    string `json:"role"`
 			Content string `json:"content"`
@@ -193,9 +190,55 @@ func TestExplicitChatCompletionsRemainsAvailable(t *testing.T) {
 				fmt.Fprint(w, `{"choices":[{"message":{"reasoning_content":"thinking","content":"answer"}}]}`)
 			}
 		}, stream, "chat_completions")
-		got, err := client.Chat(context.Background(), []Message{{Role: RoleUser, Content: "question"}})
+        requestCtx := WithResponsesContinuation(context.Background(), "ignored", []Message{{Role: RoleUser, Content: "delta only"}})
+        got, err := client.Chat(requestCtx, []Message{{Role: RoleUser, Content: "question"}})
 		if err != nil || got != "<think>thinking</think>answer" {
 			t.Fatalf("explicit chat stream=%v: %q, %v", stream, got, err)
 		}
+	}
+}
+
+func TestNativeResponsesContinuationUsesPreviousIDAndDeltaInput(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			requests := 0
+			client := responsesTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				var body struct {
+					PreviousResponseID string            `json:"previous_response_id"`
+					Input              []json.RawMessage `json:"input"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				wantID := ""
+				wantInput := 2
+				if requests == 2 {
+					wantID = "resp-1"
+					wantInput = 1
+				}
+				if body.PreviousResponseID != wantID || len(body.Input) != wantInput {
+					t.Errorf("request %d previous_response_id=%q input=%d, want %q/%d", requests, body.PreviousResponseID, len(body.Input), wantID, wantInput)
+				}
+				response := `{"id":"resp-1","status":"completed","output":[{"type":"function_call","id":"item-1","call_id":"call-1","name":"read_file","arguments":"{}","status":"completed"}]}`
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":%s}\n\n", response)
+				} else {
+					fmt.Fprint(w, response)
+				}
+			}, stream, "responses")
+			tools := []ToolDefinition{{Type: "function", Name: "read_file", Parameters: json.RawMessage(`{"type":"object"}`)}}
+			history := []Message{{Role: RoleSystem, Content: "instructions"}, {Role: RoleUser, Content: "first"}}
+			first, err := client.ChatTools(context.Background(), history, tools, nil)
+			if err != nil || first.ResponseID != "resp-1" {
+				t.Fatalf("first response ID=%q, err=%v", first.ResponseID, err)
+			}
+			continuation := WithResponsesContinuation(context.Background(), first.ResponseID, []Message{{Role: RoleUser, Content: "second"}})
+			second, err := client.ChatTools(continuation, append(history, Message{Role: RoleAssistant, Content: "prior"}, Message{Role: RoleUser, Content: "second"}), tools, nil)
+			if err != nil || second.ResponseID != "resp-1" {
+				t.Fatalf("second response ID=%q, err=%v", second.ResponseID, err)
+			}
+		})
 	}
 }
