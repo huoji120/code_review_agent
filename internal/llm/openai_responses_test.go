@@ -190,8 +190,8 @@ func TestExplicitChatCompletionsRemainsAvailable(t *testing.T) {
 				fmt.Fprint(w, `{"choices":[{"message":{"reasoning_content":"thinking","content":"answer"}}]}`)
 			}
 		}, stream, "chat_completions")
-        requestCtx := WithResponsesContinuation(context.Background(), "ignored", []Message{{Role: RoleUser, Content: "delta only"}})
-        got, err := client.Chat(requestCtx, []Message{{Role: RoleUser, Content: "question"}})
+		requestCtx := WithResponsesContinuation(context.Background(), "ignored", []Message{{Role: RoleUser, Content: "delta only"}})
+		got, err := client.Chat(requestCtx, []Message{{Role: RoleUser, Content: "question"}})
 		if err != nil || got != "<think>thinking</think>answer" {
 			t.Fatalf("explicit chat stream=%v: %q, %v", stream, got, err)
 		}
@@ -206,6 +206,8 @@ func TestNativeResponsesContinuationUsesPreviousIDAndDeltaInput(t *testing.T) {
 				requests++
 				var body struct {
 					PreviousResponseID string            `json:"previous_response_id"`
+					ToolChoice         string            `json:"tool_choice"`
+					ParallelToolCalls  bool              `json:"parallel_tool_calls"`
 					Input              []json.RawMessage `json:"input"`
 				}
 				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -217,8 +219,8 @@ func TestNativeResponsesContinuationUsesPreviousIDAndDeltaInput(t *testing.T) {
 					wantID = "resp-1"
 					wantInput = 1
 				}
-				if body.PreviousResponseID != wantID || len(body.Input) != wantInput {
-					t.Errorf("request %d previous_response_id=%q input=%d, want %q/%d", requests, body.PreviousResponseID, len(body.Input), wantID, wantInput)
+				if body.PreviousResponseID != wantID || body.ToolChoice != "required" || body.ParallelToolCalls || len(body.Input) != wantInput {
+					t.Errorf("request %d previous_response_id=%q tool_choice=%q parallel=%v input=%d, want %q/required/false/%d", requests, body.PreviousResponseID, body.ToolChoice, body.ParallelToolCalls, len(body.Input), wantID, wantInput)
 				}
 				response := `{"id":"resp-1","status":"completed","output":[{"type":"function_call","id":"item-1","call_id":"call-1","name":"read_file","arguments":"{}","status":"completed"}]}`
 				if stream {

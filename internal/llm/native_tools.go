@@ -234,6 +234,7 @@ func (c *OpenAIClient) responsesTools(ctx context.Context, messages []Message, t
 		Input              []any                  `json:"input"`
 		PreviousResponseID string                 `json:"previous_response_id,omitempty"`
 		Tools              []ToolDefinition       `json:"tools"`
+		ToolChoice         string                 `json:"tool_choice"`
 		ParallelToolCalls  bool                   `json:"parallel_tool_calls"`
 		Temperature        float64                `json:"temperature"`
 		TopP               float64                `json:"top_p"`
@@ -243,7 +244,7 @@ func (c *OpenAIClient) responsesTools(ctx context.Context, messages []Message, t
 		Reasoning          *reasoningOptions      `json:"reasoning,omitempty"`
 	}{
 		Model: c.cfg.Model, Input: nativeResponsesInput(requestMessages), PreviousResponseID: previousResponseID,
-		Tools: tools, ParallelToolCalls: false, Temperature: c.cfg.Temperature, TopP: c.cfg.TopP,
+		Tools: tools, ToolChoice: "required", ParallelToolCalls: false, Temperature: c.cfg.Temperature, TopP: c.cfg.TopP,
 		MaxOutputTokens: c.cfg.MaxOutputTokens, Stream: c.cfg.Stream, Thinking: c.cfg.Thinking, Reasoning: c.responseReasoning(),
 	}
 	progress, err := newGenerationTracker(ctx, emit)
