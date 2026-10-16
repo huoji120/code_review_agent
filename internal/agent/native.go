@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -11,8 +10,6 @@ import (
 	"code-review-agent/internal/llm"
 	"code-review-agent/internal/tools"
 )
-
-var ErrToolProtocolFailures = errors.New("连续 3 次原生工具调用失败，请检查模型和接口工具适配")
 
 // Native declarations and the execution gate share the same role contract.
 func (a *Agent) toolDefinitions() []llm.ToolDefinition {

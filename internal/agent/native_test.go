@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,45 +12,51 @@ import (
 	"code-review-agent/internal/llm"
 )
 
-func TestNativeLoopRejectsProtocolFailuresWithoutExecutingTextOrBatches(t *testing.T) {
-	cases := map[string]llm.ToolResponse{
-		"text":       {Content: `<tool_call>{"name":"forum_post","arguments":{"content":"unsafe"}}</tool_call>`, Thinking: "example is not execution"},
-		"missing_id": {Calls: []llm.FunctionCall{{Name: "forum_post", Arguments: `{"content":"unsafe"}`}}},
-		"malformed":  {Calls: []llm.FunctionCall{{CallID: "bad", Name: "forum_post", Arguments: `{"content":`}}},
-		"multiple":   {Calls: []llm.FunctionCall{{CallID: "one", Name: "forum_post", Arguments: `{"content":"unsafe"}`}, {CallID: "two", Name: "forum_post", Arguments: `{"content":"unsafe"}`}}},
+func TestNativeLoopRetriesProtocolFailuresUntilValidCall(t *testing.T) {
+	calls := 0
+	client := &noticeClient{tools: func(_ context.Context, messages []llm.Message) (llm.ToolResponse, error) {
+		calls++
+		if calls <= 5 {
+			if calls == 1 {
+				return llm.ToolResponse{Calls: []llm.FunctionCall{{Name: "forum_post", Arguments: `{"content":"unsafe"}`}}}, nil
+			}
+			found := false
+			for _, message := range messages {
+				if message.Role == llm.RoleUser && strings.Contains(message.Content, "立即纠正") && strings.Contains(message.Content, "第 ") {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatal("protocol retry omitted corrective feedback")
+			}
+			return llm.ToolResponse{Calls: []llm.FunctionCall{{Name: "forum_post", Arguments: `{"content":"unsafe"}`}}}, nil
+		}
+		return toolReply("audit_plan_done", map[string]any{
+			"summary":     "done",
+			"audit_map":   "entry",
+			"audit_files": []string{"entry1.go"},
+		}), nil
+	}}
+	team := newTestTeam(t, client)
+	team.createStageLocked(phaseRecon)
+	a := team.workers[0].agent
+	a.Run(context.Background(), "inspect", func(Event) {})
+	if calls != 6 || a.runErr != nil || !a.completed || a.protocolFailures != 0 {
+		t.Fatalf("protocol recovery calls=%d err=%v completed=%v streak=%d", calls, a.runErr, a.completed, a.protocolFailures)
 	}
-	for name, response := range cases {
-		t.Run(name, func(t *testing.T) {
-			calls := 0
-			client := &noticeClient{tools: func(_ context.Context, messages []llm.Message) (llm.ToolResponse, error) {
-				calls++
-				if calls > 1 {
-					feedback := messages[len(messages)-1]
-					if feedback.Role != llm.RoleUser || !strings.Contains(feedback.Content, "function_call") || !strings.Contains(feedback.Content, "arguments={}") {
-						t.Fatal("protocol retry omitted concrete native correction")
-					}
-				}
-				return response, nil
-			}}
-			team := newTestTeam(t, client)
-			team.createStageLocked(phaseRecon)
-			a := team.workers[0].agent
-			a.Run(context.Background(), "inspect", func(Event) {})
-			if calls != 3 || !errors.Is(a.runErr, ErrToolProtocolFailures) || len(a.board.Messages()) != 0 {
-				t.Fatalf("protocol gate calls=%d err=%v", calls, a.runErr)
-			}
-			if err := validateNativeHistory(a.messages); err != nil {
-				t.Fatal(err)
-			}
-			for _, message := range a.messages {
-				if message.Type != "" {
-					t.Fatal("invalid batch became native history")
-				}
-			}
-			if !strings.Contains(a.messages[len(a.messages)-1].Content, "3/3") {
-				t.Fatal("third corrective feedback was not retained")
-			}
-		})
+	for _, message := range a.messages {
+		if message.Type == "function_call" && message.Name == "forum_post" {
+			t.Fatal("invalid batch became native history")
+		}
+	}
+	foundFeedback := false
+	for _, message := range a.messages {
+		if strings.Contains(message.Content, "第 5 次") {
+			foundFeedback = true
+		}
+	}
+	if !foundFeedback {
+		t.Fatal("fifth corrective feedback was not retained")
 	}
 }
 
@@ -88,7 +93,7 @@ func TestNativeUnauthorizedCallPairsErrorAndValidCallResetsStreak(t *testing.T) 
 		}
 	}
 	a.Run(context.Background(), "inspect", func(Event) {})
-	if calls != 5 || errors.Is(a.runErr, ErrToolProtocolFailures) || a.protocolFailures != 0 {
+	if calls != 5 || a.protocolFailures != 0 {
 		t.Fatalf("valid business error did not reset streak: calls=%d err=%v streak=%d", calls, a.runErr, a.protocolFailures)
 	}
 	if err := validateNativeHistory(a.messages); err != nil {

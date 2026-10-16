@@ -605,9 +605,6 @@ func (a *Agent) verifyFinding(ctx context.Context, emit func(Event), raw json.Ra
 		emit(Event{Kind: "verify_done", VerifyTitle: args.Title, VerifyLimit: child.verificationTurnLimit(), VerifyStatus: status})
 	}
 	if err != nil {
-		if errors.Is(err, ErrToolProtocolFailures) {
-			a.runErr = err
-		}
 		data, _ := json.MarshalIndent(tools.Result{OK: false, Error: err.Error()}, "", "  ")
 		return string(data)
 	}
@@ -747,12 +744,9 @@ func (a *Agent) chatStream(ctx context.Context, emit func(Event)) (llm.ToolRespo
 			a.addMessage(llm.Message{Role: llm.RoleAssistant, Content: text})
 		}
 		a.protocolFailures++
-		feedback := fmt.Sprintf("原生工具协议失败 %d/3：%v。必须调用一个当前 API 声明的原生工具，类型 function_call；arguments 必须是完整 JSON 对象，API 返回非空 call_id。不要输出 XML/DSML 或把 JSON 示例写在普通回答中代替调用。具体示例：通过原生 function_call 调用 name=read_handoff，arguments={}（call_id 由原生 API 调用记录提供，不要猜测旧 ID）。每回合只能一个工具；必须实际调用工具后继续。", a.protocolFailures, err)
+		feedback := fmt.Sprintf("原生工具协议连续失败（第 %d 次）：%v。你刚才的工具调用无效，必须立即纠正后继续工作。必须调用一个当前 API 声明的原生工具，类型 function_call；arguments 必须是完整 JSON 对象；API 返回非空 call_id。不要输出 XML/DSML，也不要把 JSON 示例写在普通回答中代替调用。具体示例：通过原生 function_call 调用 name=read_handoff，arguments={}（call_id 由原生 API 调用记录提供，不要猜测旧 ID）。每回合只能一个工具；必须实际调用工具后继续。", a.protocolFailures, err)
 		a.addMessage(llm.Message{Role: llm.RoleUser, Content: feedback})
 		emit(Event{Kind: "info", Content: feedback})
-		if a.protocolFailures >= 3 {
-			return llm.ToolResponse{}, fmt.Errorf("%w：%v；当前 Agent 已失败并保留进度，由管理员检查原因，其他成员继续", ErrToolProtocolFailures, err)
-		}
 	}
 }
 
